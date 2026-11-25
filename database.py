@@ -228,7 +228,14 @@ def init_db():
 
         # If email was created with NOT NULL constraint, recreate users table so student logins without email are supported
         if user_info.get("email") and user_info["email"]["notnull"] == 1:
+            required_user_cols = {"id", "password_hash", "full_name", "role", "created_at"}
+            missing_required_cols = required_user_cols - user_info.keys()
+            if missing_required_cols:
+                missing = ", ".join(sorted(missing_required_cols))
+                raise RuntimeError(f"Cannot migrate users table; missing required columns: {missing}")
+
             cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.execute("DROP TABLE IF EXISTS users_migrated")
             cursor.execute("""
             CREATE TABLE users_migrated (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,15 +254,36 @@ def init_db():
                 updated_at TEXT NOT NULL
             );
             """)
-            cursor.execute("""
-            INSERT INTO users_migrated (id, email, username, password_hash, full_name, role, is_active, assigned_classes, check_in_pin, must_change_password, failed_login_attempts, lockout_until, created_at, updated_at)
-            SELECT id, email, username, password_hash, full_name, role,
-                   COALESCE(is_active, 1), COALESCE(assigned_classes, ''),
-                   COALESCE(check_in_pin, '1234'), COALESCE(must_change_password, 0),
-                   COALESCE(failed_login_attempts, 0), lockout_until,
-                   created_at, updated_at
-            FROM users;
-            """)
+
+            def user_column_or_default(column: str, default: str) -> str:
+                if column not in user_info:
+                    return default
+                return f"COALESCE({column}, {default})"
+
+            pin_column = "check_in_pin" if "check_in_pin" in user_info else "kiosk_pin"
+            created_at = user_column_or_default("created_at", "CURRENT_TIMESTAMP")
+            migrated_user_values = {
+                "id": "id",
+                "email": user_column_or_default("email", "NULL"),
+                "username": user_column_or_default("username", "NULL"),
+                "password_hash": "password_hash",
+                "full_name": "full_name",
+                "role": "role",
+                "is_active": user_column_or_default("is_active", "1"),
+                "assigned_classes": user_column_or_default("assigned_classes", "''"),
+                "check_in_pin": user_column_or_default(pin_column, "'1234'"),
+                "must_change_password": user_column_or_default("must_change_password", "0"),
+                "failed_login_attempts": user_column_or_default("failed_login_attempts", "0"),
+                "lockout_until": user_column_or_default("lockout_until", "NULL"),
+                "created_at": created_at,
+                "updated_at": user_column_or_default("updated_at", created_at),
+            }
+            target_columns = ", ".join(migrated_user_values)
+            source_values = ", ".join(migrated_user_values.values())
+            cursor.execute(
+                f"INSERT INTO users_migrated ({target_columns}) "
+                f"SELECT {source_values} FROM users"
+            )
             cursor.execute("DROP TABLE users;")
             cursor.execute("ALTER TABLE users_migrated RENAME TO users;")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique ON users(username);")
