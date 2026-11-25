@@ -1,5 +1,9 @@
+<<<<<<< HEAD
 ﻿__pycache__/
 *.pyc
 *.pyo
 *.db
 .mindmate.jwt_secret
+=======
+
+>>>>>>> origin/main
