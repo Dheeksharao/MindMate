@@ -1,5 +1,7 @@
 import os
-from datetime import datetime, timezone
+import json
+import uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -33,8 +35,14 @@ from logic import (
     evaluate_learning_gaps,
     check_safety_keywords,
     generate_recommendations,
-    SAFEGUARDING_MESSAGE,
+)
+from scoring_config import (
+    evaluate_adaptive_checkin_scoring,
+    check_text_for_safeguarding,
+    SAFEGUARDING_TEACHER_ALERT_MESSAGE,
+    DEFAULT_STUDENT_CALM_MESSAGE,
     DISCLAIMER_TEXT,
+    GUIDANCE_TEMPLATES,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -63,14 +71,15 @@ app.add_middleware(
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def write_audit_log(conn, user_id: Optional[int], user_email: str, action: str,
+def write_audit_log(conn, user_id: Optional[int], user_email: Optional[str], action: str,
                     resource_type: str, resource_id: Optional[int], details: str):
+    ident = user_email or "system"
     conn.execute(
         """
         INSERT INTO audit_logs (user_id, user_email, action, resource_type, resource_id, details, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, user_email, action, resource_type, resource_id, details, _now())
+        (user_id, ident, action, resource_type, resource_id, details, _now())
     )
 
 def _get_setting(conn, key: str, default: str = "") -> str:
@@ -107,9 +116,14 @@ class SetupAdminRequest(BaseModel):
     full_name: str
 
 class LoginRequest(BaseModel):
-    identifier: str           # email or username
+    identifier: Optional[str] = None
+    email: Optional[str] = None
+    username: Optional[str] = None
     password: str
     portal: str = "teacher"   # 'admin', 'teacher', 'student'
+
+class ForgotPasswordRequest(BaseModel):
+    identifier: str
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -182,6 +196,8 @@ class CheckinRequest(BaseModel):
     note: Optional[str] = None
     teacher_pin: str
 
+CheckinKioskRequest = CheckinRequest
+
 class StudentSelfCheckinRequest(BaseModel):
     mood: int = Field(..., ge=1, le=5)
     stress: int = Field(..., ge=1, le=5)
@@ -208,6 +224,16 @@ class SettingsUpdateRequest(BaseModel):
     reporting_window_days: int = 30
     checkin_frequency_days: int = 7
 
+class AdaptiveAnswerRequest(BaseModel):
+    question_id: str
+    answer: Any
+    preferred_not_to_answer: bool = False
+    note: Optional[str] = None
+
+class FollowUpStatusUpdateRequest(BaseModel):
+    status: str # 'new', 'contacted', 'in_progress', 'resolved'
+    notes: Optional[str] = ""
+
 # ─────────────────────────────────────────────
 #  PHASE 1 – Setup & Auth
 # ─────────────────────────────────────────────
@@ -220,32 +246,69 @@ def get_setup_status():
         admin_count = cursor.fetchone()["count"]
         return {"needs_setup": (admin_count == 0), "admin_count": admin_count}
 
-@app.post("/api/auth/setup")
 def setup_initial_admin(req: SetupAdminRequest):
+    email = req.email.strip().lower()
+    full_name = req.full_name.strip()
+    if not email or not full_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email and full name are required.")
+    if len(req.password) < 8:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters.")
+
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND is_active = 1")
-        if cursor.fetchone()["count"] > 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Administrator account already established. Please sign in."
-            )
-        if len(req.password) < 8:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters.")
+        existing_admin = conn.execute(
+            "SELECT id FROM users WHERE role = 'admin' LIMIT 1"
+        ).fetchone()
+        if existing_admin:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Initial setup has already been completed.")
+
+        existing_user = conn.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
         now = _now()
-        cursor.execute("""
-            INSERT INTO users (email, username, password_hash, full_name, role, is_active,
-                               assigned_classes, check_in_pin, must_change_password,
-                               failed_login_attempts, lockout_until, created_at, updated_at)
-            VALUES (?, NULL, ?, ?, 'admin', 1, '', '9999', 0, 0, NULL, ?, ?)
-        """, (req.email.strip().lower(), hash_password(req.password), req.full_name.strip(), now, now))
-        user_id = cursor.lastrowid
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        user_dict = dict(cursor.fetchone())
-        token = create_access_token(user_dict)
-        write_audit_log(conn, user_id, user_dict["email"], "INITIAL_ADMIN_SETUP", "USER", user_id,
-                        "Initial system administrator account created.")
-        return {"access_token": token, "token_type": "bearer", "user": _build_public_user(user_dict)}
+        if existing_user:
+            conn.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, full_name = ?, role = 'admin', is_active = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (hash_password(req.password), full_name, now, existing_user["id"]),
+            )
+            user_id = existing_user["id"]
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO users
+                    (email, username, password_hash, full_name, role, is_active, assigned_classes,
+                     check_in_pin, created_at, updated_at)
+                VALUES (?, NULL, ?, ?, 'admin', 1, '', '9999', ?, ?)
+                """,
+                (email, hash_password(req.password), full_name, now, now),
+            )
+            user_id = cursor.lastrowid
+
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        write_audit_log(
+            conn,
+            user_id,
+            email,
+            "INITIAL_ADMIN_SETUP",
+            "USER",
+            user_id,
+            "Initial administrator account was created.",
+        )
+
+    pub = _build_public_user(dict(user_row))
+    token = create_access_token(dict(user_row))
+    return {"access_token": token, "token_type": "bearer", "user": pub}
+
+@app.post("/api/auth/setup")
+def setup_initial_admin_endpoint(req: SetupAdminRequest):
+    return setup_initial_admin(req)
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
@@ -253,7 +316,10 @@ def login(req: LoginRequest):
     if portal not in ("admin", "teacher", "student"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid portal.")
 
-    user_dict = authenticate_user(req.identifier, req.password, portal)
+    identifier = req.identifier or req.email or req.username
+    if not identifier:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=GENERIC_LOGIN_ERROR)
+    user_dict = authenticate_user(identifier, req.password, portal)
     token = create_access_token(user_dict)
 
     # For students, attach student_id
@@ -271,6 +337,31 @@ def login(req: LoginRequest):
     pub = _build_public_user(user_dict)
     pub["student_id"] = student_id
     return {"access_token": token, "token_type": "bearer", "user": pub}
+
+@app.post("/api/auth/forgot-password")
+def request_password_reset(req: ForgotPasswordRequest):
+    identifier = req.identifier.strip().lower()
+    if not identifier:
+        return {"success": True, "message": "If the account exists, a password reset request has been sent to the administrator."}
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO password_reset_requests (identifier, status, requested_at) VALUES (?, 'pending', ?)",
+            (identifier, _now()),
+        )
+        write_audit_log(
+            conn,
+            None,
+            identifier,
+            "PASSWORD_RESET_REQUEST",
+            "USER",
+            None,
+            "A password reset request was submitted.",
+        )
+    return {
+        "success": True,
+        "message": "If the account exists, a password reset request has been sent to the administrator.",
+    }
 
 @app.get("/api/auth/me")
 def get_me(current_user: dict = Depends(get_current_user)):
@@ -783,8 +874,24 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
                 "total_students": 0,
                 "class_average_mark": 0.0,
                 "open_alerts_count": 0,
-                "wellbeing_distribution": {"Thriving": 0, "Doing okay": 0,
-                                           "May benefit from support": 0, "No data": 0},
+                "wellbeing_distribution": {
+                    "has_data": False,
+                    "empty_message": "No students are currently assigned to this teacher.",
+                    "total_assigned": 0,
+                    "included_count": 0,
+                    "pending_count": 0,
+                    "summary_text": "Based on 0 assigned students",
+                    "pending_text": "0 students pending check-in",
+                    "categories": {}
+                },
+                "teaching_insights": {
+                    "average_lesson_understanding_pct": None,
+                    "classroom_participation_pct": None,
+                    "teaching_pace_feedback": {"just_right": 0.0, "fast": 0.0, "slow": 0.0},
+                    "preferred_learning_methods": [],
+                    "academic_support_required_count": 0,
+                    "difficult_subjects": []
+                },
                 "students_need_attention": [],
                 "disclaimer": DISCLAIMER_TEXT,
                 "is_empty": True,
@@ -807,17 +914,104 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
         """, student_ids)
         open_alerts_count = cursor.fetchone()["count"]
 
-        dist = {"Thriving": 0, "Doing okay": 0, "May benefit from support": 0, "No data": 0}
+        # Reporting Window Cutoff
+        reporting_days = int(_get_setting(conn, "reporting_window_days", "30"))
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=reporting_days)
+        cutoff_iso = cutoff_dt.isoformat()
+
+        included_students_count = 0
+        distribution_counts = {"Doing Well": 0, "Moderate Concern": 0, "Needs Attention": 0}
+
+        # Insights accumulators
+        understanding_scores = []
+        question_comfort_counts = {"comfortable": 0, "hesitant": 0}
+        pace_counts = {"just_right": 0, "fast": 0, "slow": 0}
+        preferred_methods_counts = {}
+        academic_support_students = set()
+        difficult_subject_counts = {}
+
         students_need_attention = []
 
-        reporting_days = int(_get_setting(conn, "reporting_window_days", "30"))
-
         for s in students:
+            # Query latest check-in in reporting window
+            cursor.execute("""
+                SELECT * FROM checkins
+                WHERE student_id = ? AND created_at >= ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (s["id"], cutoff_iso))
+            latest_c = cursor.fetchone()
+
+            # Follow-up status check
+            cursor.execute("""
+                SELECT * FROM observations WHERE student_id = ? ORDER BY created_at DESC LIMIT 1
+            """, (s["id"],))
+            latest_obs = cursor.fetchone()
+            follow_up_status = latest_obs["status"] if latest_obs else (latest_c["follow_up_status"] if latest_c and "follow_up_status" in latest_c.keys() else "none")
+
+            if latest_c:
+                included_students_count += 1
+                indicator = latest_c["wellbeing_indicator"] if latest_c["wellbeing_indicator"] else None
+                if not indicator:
+                    sup_temp = evaluate_support_level([latest_c["score"]])
+                    lvl_temp = sup_temp["level"]
+                    if lvl_temp == "Thriving":
+                        indicator = "Doing Well"
+                    elif lvl_temp == "Doing okay":
+                        indicator = "Moderate Concern"
+                    else:
+                        indicator = "Needs Attention"
+
+                if indicator not in distribution_counts:
+                    distribution_counts[indicator] = 0
+                distribution_counts[indicator] += 1
+
+                # Parse snapshot for insights
+                snapshot_raw = latest_c["answers_snapshot_json"] if "answers_snapshot_json" in latest_c.keys() and latest_c["answers_snapshot_json"] else "{}"
+                try:
+                    snapshot = json.loads(snapshot_raw) if snapshot_raw else {}
+                except Exception:
+                    snapshot = {}
+
+                for qk, qval in snapshot.items():
+                    ans = qval.get("answer") if isinstance(qval, dict) else qval
+                    # Lesson understanding
+                    if "understanding" in qk:
+                        if ans in ["und_all", "und_most"]:
+                            understanding_scores.append(100.0 if ans == "und_all" else 80.0)
+                        elif ans == "und_half":
+                            understanding_scores.append(60.0)
+                        elif ans in ["und_struggling", "und_lost"]:
+                            understanding_scores.append(40.0 if ans == "und_struggling" else 20.0)
+                    # Question comfort
+                    if "question_comfort" in qk:
+                        if ans in ["qc_very", "qc_sometimes"]:
+                            question_comfort_counts["comfortable"] += 1
+                        else:
+                            question_comfort_counts["hesitant"] += 1
+                    # Pace
+                    if "pace" in qk:
+                        if ans == "tp_just_right":
+                            pace_counts["just_right"] += 1
+                        elif ans in ["tp_fast", "tp_racing"]:
+                            pace_counts["fast"] += 1
+                        elif ans == "tp_slow":
+                            pace_counts["slow"] += 1
+                    # Preferred method
+                    if "preferred_method" in qk and isinstance(ans, str):
+                        m_label = {"pm_visual": "Visual", "pm_hands_on": "Hands-on", "pm_listening": "Listening", "pm_reading": "Reading"}.get(ans, "Other")
+                        preferred_methods_counts[m_label] = preferred_methods_counts.get(m_label, 0) + 1
+                    # Difficult subjects
+                    if "subject" in qk and isinstance(ans, str) and ans.startswith("subj_"):
+                        s_name = {"subj_math": "Mathematics", "subj_science": "Science", "subj_lang": "Languages", "subj_social": "Social Studies", "subj_all": "All Subjects"}.get(ans, ans)
+                        difficult_subject_counts[s_name] = difficult_subject_counts.get(s_name, 0) + 1
+                    # Support asked
+                    if "support_ask" in qk and ans in ["asa_practice", "asa_teacher", "asa_buddy"]:
+                        academic_support_students.add(s["id"])
+
             cursor.execute("SELECT score FROM checkins WHERE student_id = ? ORDER BY created_at ASC", (s["id"],))
             scores = [r["score"] for r in cursor.fetchall()]
             support_info = evaluate_support_level(scores)
             lvl = support_info["level"]
-            dist[lvl if lvl in dist else "No data"] += 1
 
             cursor.execute("SELECT * FROM assessments WHERE student_id = ? ORDER BY date ASC, id ASC", (s["id"],))
             a_rows = [dict(r) for r in cursor.fetchall()]
@@ -838,11 +1032,12 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             if gaps:
                 reasons.append(f"Learning gap: {', '.join(g['subject'] for g in gaps)}")
 
-            if reasons:
+            if reasons or follow_up_status in ["new", "contacted", "in_progress"]:
                 students_need_attention.append({
                     "id": s["id"],
                     "name": s["name"],
                     "class_name": s["class_name"],
+                    "roll_number": s.get("roll_number", ""),
                     "support_level": lvl,
                     "support_reason": support_info["reason"],
                     "badge_class": support_info["badge_class"],
@@ -850,19 +1045,78 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
                     "open_alerts": st_alerts,
                     "has_urgent": has_urgent,
                     "reasons": reasons,
-                    "summary_reason": "; ".join(reasons),
+                    "summary_reason": "; ".join(reasons) if reasons else "Follow-up in progress",
+                    "follow_up_status": follow_up_status or "new"
                 })
 
         students_need_attention.sort(
             key=lambda x: (not x["has_urgent"], x["support_level"] != "May benefit from support")
         )
 
+        total_assigned = len(students)
+        pending_checkins_count = total_assigned - included_students_count
+
+        if included_students_count == 0:
+            distribution_data = {
+                "has_data": False,
+                "empty_message": "No assessments completed yet.",
+                "total_assigned": total_assigned,
+                "included_count": 0,
+                "pending_count": pending_checkins_count,
+                "summary_text": f"Based on 0 of {total_assigned} assigned students",
+                "pending_text": f"{pending_checkins_count} students pending check-in",
+                "categories": {}
+            }
+        else:
+            categories = {}
+            for cat in ["Doing Well", "Moderate Concern", "Needs Attention"]:
+                c_cnt = distribution_counts.get(cat, 0)
+                c_pct = round((c_cnt / included_students_count) * 100.0, 1)
+                categories[cat] = {
+                    "count": c_cnt,
+                    "percentage": c_pct,
+                    "display": f"{cat}: {c_cnt} students ({c_pct}%)"
+                }
+            distribution_data = {
+                "has_data": True,
+                "total_assigned": total_assigned,
+                "included_count": included_students_count,
+                "pending_count": pending_checkins_count,
+                "summary_text": f"Based on {included_students_count} of {total_assigned} assigned students",
+                "pending_text": f"{pending_checkins_count} students pending check-in",
+                "categories": categories,
+                "counts": distribution_counts
+            }
+
+        avg_und = round(sum(understanding_scores) / max(len(understanding_scores), 1), 1) if understanding_scores else None
+        tot_qc = question_comfort_counts["comfortable"] + question_comfort_counts["hesitant"]
+        qc_pct = round((question_comfort_counts["comfortable"] / tot_qc) * 100.0, 1) if tot_qc > 0 else None
+        tot_pace = sum(pace_counts.values())
+        pace_breakdown = {
+            "just_right": round((pace_counts["just_right"] / tot_pace) * 100.0, 1) if tot_pace > 0 else 0.0,
+            "fast": round((pace_counts["fast"] / tot_pace) * 100.0, 1) if tot_pace > 0 else 0.0,
+            "slow": round((pace_counts["slow"] / tot_pace) * 100.0, 1) if tot_pace > 0 else 0.0
+        }
+        teaching_insights = {
+            "average_lesson_understanding_pct": avg_und,
+            "classroom_participation_pct": qc_pct,
+            "teaching_pace_feedback": pace_breakdown,
+            "preferred_learning_methods": [
+                {"method": k, "count": v} for k, v in sorted(preferred_methods_counts.items(), key=lambda x: x[1], reverse=True)
+            ],
+            "academic_support_required_count": len(academic_support_students),
+            "difficult_subjects": [
+                {"subject": k, "count": v} for k, v in sorted(difficult_subject_counts.items(), key=lambda x: x[1], reverse=True)
+            ]
+        }
+
         return {
             "role": "teacher",
             "total_students": len(students),
             "class_average_mark": class_average_mark,
             "open_alerts_count": open_alerts_count,
-            "wellbeing_distribution": dist,
+            "wellbeing_distribution": distribution_data,
+            "teaching_insights": teaching_insights,
             "students_need_attention": students_need_attention,
             "disclaimer": DISCLAIMER_TEXT,
             "is_empty": False,
@@ -1001,6 +1255,30 @@ def get_student_profile(student_id: int, current_user: dict = Depends(get_curren
             WHERE o.student_id = ? ORDER BY o.created_at DESC
         """, (student_id,))
         observations = [dict(r) for r in cursor.fetchall()]
+
+        # Privacy filtering for student role:
+        # Students must NOT see internal labels such as "Needs Attention", teacher notes, or follow-up flags.
+        if current_user["role"] == "student":
+            return {
+                "student": {
+                    "id": student_dict["id"],
+                    "name": student_dict["name"],
+                    "roll_number": student_dict.get("roll_number", ""),
+                    "class_name": student_dict["class_name"],
+                    "teacher_name": student_dict.get("teacher_name", "")
+                },
+                "assessments": assessments,
+                "learning_gaps": learning_gaps,
+                "checkins": [{
+                    "id": c["id"],
+                    "created_at": c["created_at"],
+                    "note": c["note"]
+                } for c in checkins_out],
+                "recommendations": recommendations,
+                "alerts": [],
+                "observations": [],
+                "disclaimer": DISCLAIMER_TEXT,
+            }
 
         return {
             "student": student_dict,
@@ -1302,6 +1580,342 @@ def student_self_checkin(req: StudentSelfCheckinRequest, current_user: dict = De
         }
 
 # ─────────────────────────────────────────────
+#  PHASE 4 – Adaptive Mental Health Check-In Engine
+# ─────────────────────────────────────────────
+
+@app.get("/api/checkins/active")
+def get_active_checkin_session(current_user: dict = Depends(require_student)):
+    """Checks if the logged-in student has an in_progress adaptive check-in session."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM students WHERE user_id = ? AND is_archived = 0", (current_user["id"],))
+        st = cursor.fetchone()
+        if not st:
+            return {"active": False}
+        cursor.execute("""
+            SELECT s.*, q.domain, q.question_text, q.answer_type, q.options_json, q.prefer_not_to_answer
+            FROM check_in_sessions s
+            LEFT JOIN check_in_questions q ON s.current_question_id = q.id
+            WHERE s.student_id = ? AND s.status = 'in_progress'
+            ORDER BY s.started_at DESC LIMIT 1
+        """, (st["id"],))
+        row = cursor.fetchone()
+        if not row:
+            return {"active": False}
+        opts = json.loads(row["options_json"]) if row["options_json"] else []
+        public_opts = [{"id": o["id"], "label": o["label"]} for o in opts]
+        history = json.loads(row["question_history_json"]) if row["question_history_json"] else []
+        return {
+            "active": True,
+            "session_id": row["id"],
+            "question": {
+                "id": row["current_question_id"],
+                "domain": row["domain"],
+                "question_text": row["question_text"],
+                "answer_type": row["answer_type"],
+                "options": public_opts,
+                "prefer_not_to_answer": bool(row["prefer_not_to_answer"])
+            },
+            "total_answered": len(history),
+            "progress_pct": min(round((len(history) / 12) * 100), 95),
+            "disclaimer": DISCLAIMER_TEXT
+        }
+
+@app.post("/api/checkins/start")
+def start_adaptive_checkin(current_user: dict = Depends(require_student)):
+    """Initializes a new adaptive check-in session with questions dynamically selected by the backend."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM students WHERE user_id = ? AND is_archived = 0", (current_user["id"],))
+        student = cursor.fetchone()
+        if not student:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student profile not linked to this account.")
+
+        session_id = str(uuid.uuid4())
+        now = _now()
+
+        # Fetch first root question
+        cursor.execute("SELECT * FROM check_in_questions WHERE is_root = 1 ORDER BY root_order ASC LIMIT 1")
+        first_q = cursor.fetchone()
+        if not first_q:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Question bank not initialized.")
+
+        cursor.execute("""
+            INSERT INTO check_in_sessions (id, student_id, status, current_question_id,
+                                          question_history_json, answers_json, domain_scores_json,
+                                          concern_tags_json, started_at)
+            VALUES (?, ?, 'in_progress', ?, '[]', '{}', '{}', '[]', ?)
+        """, (session_id, student["id"], first_q["id"], now))
+
+        write_audit_log(conn, current_user["id"], current_user.get("username") or "",
+                        "START_ADAPTIVE_CHECKIN", "CHECKIN_SESSION", None,
+                        f"Student '{student['name']}' started adaptive check-in")
+
+        opts = json.loads(first_q["options_json"])
+        public_opts = [{"id": o["id"], "label": o["label"]} for o in opts]
+
+        return {
+            "status": "in_progress",
+            "session_id": session_id,
+            "question": {
+                "id": first_q["id"],
+                "domain": first_q["domain"],
+                "question_text": first_q["question_text"],
+                "answer_type": first_q["answer_type"],
+                "options": public_opts,
+                "prefer_not_to_answer": bool(first_q["prefer_not_to_answer"])
+            },
+            "total_answered": 0,
+            "progress_pct": 0,
+            "disclaimer": DISCLAIMER_TEXT
+        }
+
+@app.post("/api/checkins/{session_id}/answer")
+def answer_adaptive_checkin(session_id: str, req: AdaptiveAnswerRequest, current_user: dict = Depends(require_student)):
+    """Receives student's answer, updates concern levels, and dynamically returns the next question or completion result."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM students WHERE user_id = ? AND is_archived = 0", (current_user["id"],))
+        student = cursor.fetchone()
+        if not student:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student profile not linked to this account.")
+
+        cursor.execute("SELECT * FROM check_in_sessions WHERE id = ? AND student_id = ? AND status = 'in_progress'",
+                       (session_id, student["id"]))
+        session = cursor.fetchone()
+        if not session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active check-in session not found or already completed.")
+
+        cursor.execute("SELECT * FROM check_in_questions WHERE id = ?", (req.question_id,))
+        q_row = cursor.fetchone()
+        if not q_row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in database.")
+
+        q_domain = q_row["domain"]
+        q_opts = json.loads(q_row["options_json"])
+        q_rules = json.loads(q_row["branching_rules_json"]) if q_row["branching_rules_json"] else {}
+        history = json.loads(session["question_history_json"])
+        answers = json.loads(session["answers_json"])
+        domain_scores = json.loads(session["domain_scores_json"])
+        tags_accum = set(json.loads(session["concern_tags_json"]))
+
+        ans_score = 0.0
+        ans_tags = []
+        is_urgent = False
+
+        if req.preferred_not_to_answer:
+            ans_score = 0.0
+            ans_tags.append("preferred_not_to_answer")
+        elif q_row["answer_type"] == "optional_free_text":
+            text_val = str(req.answer or req.note or "")
+            is_u, matched_kw = check_text_for_safeguarding(text_val)
+            if is_u:
+                is_urgent = True
+                ans_score = 1.0
+                ans_tags.append("urgent_safeguarding")
+        elif q_row["answer_type"] == "multi_choice":
+            chosen = req.answer if isinstance(req.answer, list) else [req.answer]
+            matched_opts = [o for o in q_opts if o["id"] in chosen]
+            if matched_opts:
+                ans_score = max(o.get("concern_score", 0.0) for o in matched_opts)
+                for o in matched_opts:
+                    ans_tags.extend(o.get("tags", []))
+                    if "urgent_safeguarding" in o.get("tags", []):
+                        is_urgent = True
+        else: # single_choice, scale
+            chosen = str(req.answer)
+            matched_opt = next((o for o in q_opts if o["id"] == chosen), None)
+            if matched_opt:
+                ans_score = matched_opt.get("concern_score", 0.0)
+                ans_tags.extend(matched_opt.get("tags", []))
+                if "urgent_safeguarding" in matched_opt.get("tags", []):
+                    is_urgent = True
+
+        if req.note:
+            is_u_note, _ = check_text_for_safeguarding(req.note)
+            if is_u_note:
+                is_urgent = True
+                ans_tags.append("urgent_safeguarding")
+
+        if is_urgent:
+            cursor.execute("""
+                SELECT id FROM alerts WHERE student_id = ? AND alert_type = 'safety' AND status = 'open'
+            """, (student["id"],))
+            if not cursor.fetchone():
+                now_u = _now()
+                cursor.execute("""
+                    INSERT INTO alerts (student_id, alert_type, title, message, severity, status, subject, created_at, updated_at)
+                    VALUES (?, 'safety', ?, ?, 'urgent', 'open', '', ?, ?)
+                """, (student["id"], f"🚨 Urgent Safeguarding Notice: {student['name']}",
+                      SAFEGUARDING_TEACHER_ALERT_MESSAGE, now_u, now_u))
+
+        tags_accum.update(ans_tags)
+
+        answers[req.question_id] = {
+            "answer": req.answer,
+            "preferred_not_to_answer": req.preferred_not_to_answer,
+            "score": ans_score,
+            "tags": ans_tags,
+            "question_text": q_row["question_text"],
+            "domain": q_domain,
+            "note": req.note
+        }
+
+        domain_q_scores = [a["score"] for a in answers.values() if a.get("domain") == q_domain and not a.get("preferred_not_to_answer")]
+        if domain_q_scores:
+            domain_scores[q_domain] = round(sum(domain_q_scores) / len(domain_q_scores), 2)
+
+        if req.question_id not in history:
+            history.append(req.question_id)
+
+        next_q_row = None
+
+        # 1. Branching rule follow-ups
+        follow_ups = q_rules.get("follow_ups", {})
+        if isinstance(req.answer, list):
+            for opt_id in req.answer:
+                target_qid = follow_ups.get(opt_id)
+                if target_qid and target_qid not in history:
+                    cursor.execute("SELECT * FROM check_in_questions WHERE id = ?", (target_qid,))
+                    next_q_row = cursor.fetchone()
+                    if next_q_row:
+                        break
+        elif isinstance(req.answer, str):
+            target_qid = follow_ups.get(req.answer)
+            if target_qid and target_qid not in history:
+                cursor.execute("SELECT * FROM check_in_questions WHERE id = ?", (target_qid,))
+                next_q_row = cursor.fetchone()
+
+        # 2. Check next root question
+        if not next_q_row:
+            ph = ",".join("?" for _ in history) if history else "''"
+            cursor.execute(f"""
+                SELECT * FROM check_in_questions
+                WHERE is_root = 1 AND id NOT IN ({ph})
+                ORDER BY root_order ASC LIMIT 1
+            """, history)
+            next_q_row = cursor.fetchone()
+
+        # 3. Check for early completion
+        max_concern = max(domain_scores.values()) if domain_scores else 0.0
+        hard_max_reached = len(history) >= 25
+        natural_end = (next_q_row is None) or (len(history) >= 8 and next_q_row is None and max_concern < 0.35)
+
+        if hard_max_reached or natural_end:
+            now = _now()
+            scoring_res = evaluate_adaptive_checkin_scoring(domain_scores, answers, is_urgent or ("urgent_safeguarding" in tags_accum))
+
+            overall_concern = scoring_res["overall_score"]
+            scaled_score = round(max(1.0, min(5.0, 5.0 - overall_concern * 4.0)), 2)
+
+            mood_val = 5 - int(domain_scores.get("Mood & Emotions", 0.0) * 4)
+            stress_val = 1 + int(domain_scores.get("Stress & Pressure", 0.0) * 4)
+            sleep_val = 5 - int(domain_scores.get("Daily Routine & Habits", 0.0) * 4)
+            focus_val = 5 - int(domain_scores.get("Concentration & Focus", 0.0) * 4)
+            belonging_val = 5 - int(domain_scores.get("Social & School Experience", 0.0) * 4)
+
+            note_pieces = [a["note"] for a in answers.values() if a.get("note")]
+            combined_notes = " | ".join(note_pieces) if note_pieces else None
+            encrypted_note = encrypt_note(combined_notes) if combined_notes else None
+
+            cursor.execute("""
+                INSERT INTO checkins (
+                    student_id, mood, stress, sleep, focus, belonging,
+                    encrypted_note, score, created_at, session_id,
+                    wellbeing_indicator, indicator_reasons, domain_scores_json,
+                    academic_concerns_json, teaching_concerns_json, recommendations_json,
+                    urgent_flag, follow_up_status, answers_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                student["id"], mood_val, stress_val, sleep_val, focus_val, belonging_val,
+                encrypted_note, scaled_score, now, session_id,
+                scoring_res["wellbeing_indicator"],
+                json.dumps(scoring_res["indicator_reasons"]),
+                json.dumps(domain_scores),
+                json.dumps([k for k, v in answers.items() if "academic" in k]),
+                json.dumps([k for k, v in answers.items() if "teaching" in k]),
+                json.dumps(scoring_res["recommendations"]),
+                1 if scoring_res["urgent_flag"] else 0,
+                "pending" if scoring_res["wellbeing_indicator"] != "Doing Well" else "none",
+                json.dumps(answers)
+            ))
+            checkin_id = cursor.lastrowid
+
+            cursor.execute("""
+                UPDATE check_in_sessions
+                SET status = 'completed', question_history_json = ?, answers_json = ?,
+                    domain_scores_json = ?, concern_tags_json = ?, completed_at = ?
+                WHERE id = ?
+            """, (json.dumps(history), json.dumps(answers), json.dumps(domain_scores),
+                  json.dumps(list(tags_accum)), now, session_id))
+
+            sg_name = _get_setting(conn, "safeguarding_contact_name", "")
+            sg_phone = _get_setting(conn, "safeguarding_contact_phone", "")
+            sg_email = _get_setting(conn, "safeguarding_contact_email", "")
+
+            student_calm_msg = DEFAULT_STUDENT_CALM_MESSAGE
+            if sg_name:
+                contact_details = f"{sg_name} ({sg_phone or sg_email or 'Safeguarding Lead'})"
+                student_calm_msg = (
+                    f"Thank you for sharing with us. Your well-being matters to us deeply. "
+                    f"If you need to talk right now, please reach out to {contact_details} or your class teacher."
+                )
+
+            if scoring_res["urgent_flag"]:
+                cursor.execute("""
+                    INSERT INTO alerts (student_id, alert_type, title, message, severity, status, subject, created_at, updated_at)
+                    VALUES (?, 'safety', ?, ?, 'urgent', 'open', '', ?, ?)
+                """, (student["id"], f"🚨 Urgent Safeguarding Notice: {student['name']}",
+                      SAFEGUARDING_TEACHER_ALERT_MESSAGE, now, now))
+            elif scoring_res["wellbeing_indicator"] == "Needs Attention":
+                cursor.execute("""
+                    INSERT INTO alerts (student_id, alert_type, title, message, severity, status, subject, created_at, updated_at)
+                    VALUES (?, 'support_level', ?, ?, 'standard', 'open', '', ?, ?)
+                """, (student["id"], f"Well-being follow-up needed: {student['name']}",
+                      f"Well-being indicator: {'; '.join(scoring_res['indicator_reasons'])}", now, now))
+
+            write_audit_log(conn, current_user["id"], current_user.get("username") or "",
+                            "COMPLETE_ADAPTIVE_CHECKIN", "CHECKIN", checkin_id,
+                            f"Student '{student['name']}' completed adaptive check-in. Indicator: {scoring_res['wellbeing_indicator']}")
+
+            return {
+                "status": "completed",
+                "wellbeing_indicator": scoring_res["wellbeing_indicator"],
+                "recommendations": scoring_res["recommendations"],
+                "total_answered": len(history),
+                "urgent_flag": scoring_res["urgent_flag"],
+                "safeguarding_message": student_calm_msg if scoring_res["urgent_flag"] else None,
+                "disclaimer": DISCLAIMER_TEXT
+            }
+
+        cursor.execute("""
+            UPDATE check_in_sessions
+            SET current_question_id = ?, question_history_json = ?, answers_json = ?,
+                domain_scores_json = ?, concern_tags_json = ?
+            WHERE id = ?
+        """, (next_q_row["id"], json.dumps(history), json.dumps(answers),
+              json.dumps(domain_scores), json.dumps(list(tags_accum)), session_id))
+
+        next_opts = json.loads(next_q_row["options_json"])
+        public_next_opts = [{"id": o["id"], "label": o["label"]} for o in next_opts]
+
+        return {
+            "status": "in_progress",
+            "session_id": session_id,
+            "question": {
+                "id": next_q_row["id"],
+                "domain": next_q_row["domain"],
+                "question_text": next_q_row["question_text"],
+                "answer_type": next_q_row["answer_type"],
+                "options": public_next_opts,
+                "prefer_not_to_answer": bool(next_q_row["prefer_not_to_answer"])
+            },
+            "total_answered": len(history),
+            "progress_pct": min(round((len(history) / 12) * 100), 95),
+            "disclaimer": DISCLAIMER_TEXT
+        }
+
+# ─────────────────────────────────────────────
 #  Observations & Follow-ups
 # ─────────────────────────────────────────────
 
@@ -1364,6 +1978,27 @@ def update_observation_status(obs_id: int, req: ObservationStatusRequest,
         cursor.execute("UPDATE observations SET status = ?, updated_at = ? WHERE id = ?",
                        (req.status, _now(), obs_id))
         return {"id": obs_id, "status": req.status}
+
+@app.put("/api/students/{student_id}/follow-up")
+def update_student_followup_status(student_id: int, req: FollowUpStatusUpdateRequest, current_user: dict = Depends(require_teacher_or_admin)):
+    status_val = req.status.strip().lower().replace(" ", "_")
+    valid_statuses = ["new", "contacted", "in_progress", "resolved"]
+    if status_val not in valid_statuses:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid status. Choose from {valid_statuses}")
+    with get_db() as conn:
+        cursor = conn.cursor()
+        student = _get_student_or_404(cursor, student_id)
+        check_student_record_access(current_user, student)
+        now = _now()
+        cursor.execute("UPDATE checkins SET follow_up_status = ? WHERE student_id = ?", (status_val, student_id))
+        cursor.execute("""
+            INSERT INTO observations (student_id, teacher_id, observation_text, follow_up_action, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (student_id, current_user["id"], req.notes or f"Follow-up status set to {status_val}", f"Workflow status: {status_val}", status_val, now, now))
+        write_audit_log(conn, current_user["id"], current_user.get("email", ""),
+                        "UPDATE_FOLLOWUP_STATUS", "STUDENT", student_id,
+                        f"Updated follow-up status for '{student['name']}' to '{status_val}'")
+        return {"student_id": student_id, "follow_up_status": status_val, "updated_at": now}
 
 # ─────────────────────────────────────────────
 #  Alerts

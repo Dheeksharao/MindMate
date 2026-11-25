@@ -118,3 +118,81 @@ def test_rule_f_recommendations():
     assert "Academic: Math" in categories
     assert any("buddy" in r["action"].lower() for r in recs)
     assert any("practice set" in r["action"].lower() for r in recs)
+
+# ====================================================================
+# Tests for scoring_config.py (Phase 5: Scoring, Safeguarding, Guidance)
+# ====================================================================
+from scoring_config import (
+    calculate_domain_concern_level,
+    evaluate_adaptive_checkin_scoring,
+    check_text_for_safeguarding,
+    GUIDANCE_TEMPLATES,
+    DISCLAIMER_TEXT,
+    SAFEGUARDING_TEACHER_ALERT_MESSAGE,
+    DEFAULT_STUDENT_CALM_MESSAGE
+)
+
+def test_classify_domain_concern():
+    # Low concern < 0.35
+    assert calculate_domain_concern_level(0.0) == "Low"
+    assert calculate_domain_concern_level(0.2) == "Low"
+    assert calculate_domain_concern_level(0.34) == "Low"
+    # Medium concern 0.35 - 0.64
+    assert calculate_domain_concern_level(0.35) == "Medium"
+    assert calculate_domain_concern_level(0.50) == "Medium"
+    assert calculate_domain_concern_level(0.64) == "Medium"
+    # High concern >= 0.65
+    assert calculate_domain_concern_level(0.65) == "High"
+    assert calculate_domain_concern_level(0.90) == "High"
+    assert calculate_domain_concern_level(1.0) == "High"
+
+def test_evaluate_adaptive_checkin_scoring_doing_well():
+    low_scores = {"mood": 0.1, "stress": 0.2, "academic": 0.15, "social": 0.1}
+    res = evaluate_adaptive_checkin_scoring(low_scores, {})
+    assert res["wellbeing_indicator"] == "Doing Well"
+    assert res["urgent_flag"] is False
+    assert res["overall_score"] < 0.30
+
+def test_evaluate_adaptive_checkin_scoring_moderate_concern():
+    # Exactly 1 high concern
+    one_high = {"mood": 0.1, "stress": 0.1, "academic": 0.8}
+    res = evaluate_adaptive_checkin_scoring(one_high, {})
+    assert res["wellbeing_indicator"] == "Moderate Concern"
+    assert res["domain_levels"]["academic"] == "High"
+
+    # Moderate average
+    mid_scores = {"mood": 0.4, "stress": 0.35, "academic": 0.45}
+    res2 = evaluate_adaptive_checkin_scoring(mid_scores, {})
+    assert res2["wellbeing_indicator"] == "Moderate Concern"
+
+def test_evaluate_adaptive_checkin_scoring_needs_attention():
+    # 2 high concerns
+    two_high = {"mood": 0.8, "stress": 0.75, "academic": 0.2}
+    res = evaluate_adaptive_checkin_scoring(two_high, {})
+    assert res["wellbeing_indicator"] == "Needs Attention"
+
+    # Urgent trigger elevates directly to Needs Attention
+    low_scores = {"mood": 0.1, "stress": 0.1}
+    res_urgent = evaluate_adaptive_checkin_scoring(low_scores, {}, urgent_flag=True)
+    assert res_urgent["wellbeing_indicator"] == "Needs Attention"
+    assert res_urgent["urgent_flag"] is True
+
+def test_check_text_for_safeguarding():
+    has_urgent, kw = check_text_for_safeguarding("I feel like giving up on everything.")
+    assert has_urgent is True
+    assert kw == "giving up"
+
+    has_urgent2, kw2 = check_text_for_safeguarding("I feel unsafe at home.")
+    assert has_urgent2 is True
+    assert kw2 == "unsafe"
+
+    has_urgent_safe, _ = check_text_for_safeguarding("Just tired after football practice.")
+    assert has_urgent_safe is False
+
+def test_guidance_templates_and_disclaimer():
+    assert "caring conversation" in DISCLAIMER_TEXT.lower()
+    assert "designated safeguarding lead" in SAFEGUARDING_TEACHER_ALERT_MESSAGE.lower()
+    assert "reach out to your mentor teacher" in DEFAULT_STUDENT_CALM_MESSAGE.lower()
+    assert "exam_stress" in GUIDANCE_TEMPLATES
+    assert "sleep_difficulty" in GUIDANCE_TEMPLATES
+    assert "skipped_breakfast" in GUIDANCE_TEMPLATES
