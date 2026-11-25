@@ -1,37 +1,24 @@
-// MindMate – Student Well-being & Academic Support (v2.0)
+// MindMate – Student Well-being & Academic Support (v3.0)
 // Fully Database-Driven SPA Client Engine
 
+// In-Memory Token Storage (Strict Security Rule: NO localStorage for sensitive auth tokens)
+let authToken = null;
 let currentUser = null;
-let authToken = localStorage.getItem("mindmate_token") || null;
 let currentView = "login";
 let activeStudentProfileId = null;
 
 let wellbeingChartInstance = null;
 let studentChartInstance = null;
 
-// Kiosk State
-let kioskStudentId = null;
-let kioskTeacherPin = "";
-let kioskCurrentStep = 1;
-const kioskAnswers = {
-  mood: null,
-  stress: null,
-  sleep: null,
-  focus: null,
-  belonging: null,
-  note: ""
-};
+// Adaptive Check-In Session State
+let activeAdaptiveSessionId = null;
+let currentQuestionData = null;
+let selectedAdaptiveAnswers = [];
+let isClassroomDeviceSession = false;
 
-// Student Self Check-in State
-const selfCheckinAnswers = {
-  mood: null,
-  stress: null,
-  sleep: null,
-  focus: null,
-  belonging: null
-};
-
-// ----------------- API Fetch Client -----------------
+// ─────────────────────────────────────────────
+//  API Fetch Client
+// ─────────────────────────────────────────────
 
 async function apiFetch(endpoint, options = {}) {
   const headers = {
@@ -49,12 +36,13 @@ async function apiFetch(endpoint, options = {}) {
 
   if (response.status === 401) {
     logout();
-    throw new Error("Session expired or unauthorized. Please sign in again.");
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || "Authentication required. Please sign in.");
   }
 
   if (response.status === 403) {
     const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.detail || "Access forbidden: You do not have permission for this resource.");
+    throw new Error(errData.detail || "Access denied.");
   }
 
   if (!response.ok) {
@@ -65,7 +53,9 @@ async function apiFetch(endpoint, options = {}) {
   return response.json();
 }
 
-// ----------------- App Initialization -----------------
+// ─────────────────────────────────────────────
+//  App Initialization
+// ─────────────────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", async () => {
   try {
@@ -75,25 +65,15 @@ window.addEventListener("DOMContentLoaded", async () => {
       return;
     }
   } catch (err) {
-    console.error("Setup check error:", err);
+    console.warn("Setup check error:", err);
   }
 
-  if (authToken) {
-    try {
-      currentUser = await apiFetch("/api/auth/me");
-      updateNavForUser();
-      navigateHome();
-      return;
-    } catch (e) {
-      console.warn("Session check failed:", e.message);
-      authToken = null;
-      localStorage.removeItem("mindmate_token");
-    }
-  }
   navigate("login");
 });
 
-// ----------------- Navigation Engine -----------------
+// ─────────────────────────────────────────────
+//  Navigation Engine
+// ─────────────────────────────────────────────
 
 function navigateHome() {
   if (!currentUser) {
@@ -118,6 +98,8 @@ function navigate(viewName) {
     "view-admin-dashboard",
     "view-admin-teachers",
     "view-admin-students",
+    "view-admin-assignments",
+    "view-admin-settings",
     "view-admin-audit",
     "view-teacher-dashboard",
     "view-teacher-students",
@@ -147,141 +129,237 @@ function navigate(viewName) {
 
   navBar.style.display = "flex";
 
-  // Route routing
+  // Role Protection check
+  if (!currentUser) {
+    navigate("login");
+    return;
+  }
+
+  const targetEl = document.getElementById(`view-${viewName}`);
+  if (targetEl) targetEl.style.display = "block";
+
+  // Dispatch data loader based on view
   if (viewName === "admin-dashboard") {
-    document.getElementById("nav-admin-dash").classList.add("active");
-    document.getElementById("view-admin-dashboard").style.display = "block";
+    const link = document.getElementById("nav-admin-dash");
+    if (link) link.classList.add("active");
     loadAdminDashboard();
   } else if (viewName === "admin-teachers") {
-    document.getElementById("nav-admin-teachers").classList.add("active");
-    document.getElementById("view-admin-teachers").style.display = "block";
+    const link = document.getElementById("nav-admin-teachers");
+    if (link) link.classList.add("active");
     loadAdminTeachers();
   } else if (viewName === "admin-students") {
-    document.getElementById("nav-admin-students").classList.add("active");
-    document.getElementById("view-admin-students").style.display = "block";
+    const link = document.getElementById("nav-admin-students");
+    if (link) link.classList.add("active");
     loadAdminStudents();
+  } else if (viewName === "admin-assignments") {
+    const link = document.getElementById("nav-admin-assignments");
+    if (link) link.classList.add("active");
+    loadAdminAssignmentsView();
+  } else if (viewName === "admin-settings") {
+    const link = document.getElementById("nav-admin-settings");
+    if (link) link.classList.add("active");
+    loadAdminSettingsView();
   } else if (viewName === "admin-audit") {
-    document.getElementById("nav-admin-audit").classList.add("active");
-    document.getElementById("view-admin-audit").style.display = "block";
+    const link = document.getElementById("nav-admin-audit");
+    if (link) link.classList.add("active");
     loadAuditLogs();
   } else if (viewName === "teacher-dashboard") {
-    document.getElementById("nav-teacher-dash").classList.add("active");
-    document.getElementById("view-teacher-dashboard").style.display = "block";
+    const link = document.getElementById("nav-teacher-dash");
+    if (link) link.classList.add("active");
     loadTeacherDashboard();
   } else if (viewName === "teacher-students") {
-    document.getElementById("nav-teacher-students").classList.add("active");
-    document.getElementById("view-teacher-students").style.display = "block";
+    const link = document.getElementById("nav-teacher-students");
+    if (link) link.classList.add("active");
     loadTeacherStudents();
-  } else if (viewName === "student-profile") {
-    document.getElementById("view-student-profile").style.display = "block";
-    if (activeStudentProfileId) {
-      loadStudentProfile(activeStudentProfileId);
-    }
   } else if (viewName === "teacher-alerts") {
-    document.getElementById("nav-teacher-alerts").classList.add("active");
-    document.getElementById("view-teacher-alerts").style.display = "block";
+    const link = document.getElementById("nav-teacher-alerts");
+    if (link) link.classList.add("active");
     loadTeacherAlerts();
   } else if (viewName === "student-portal") {
-    document.getElementById("nav-student-dash").classList.add("active");
-    document.getElementById("view-student-portal").style.display = "block";
+    const link = document.getElementById("nav-student-dash");
+    if (link) link.classList.add("active");
     loadStudentPortal();
   }
 }
 
 function updateNavForUser() {
+  document.getElementById("nav-links-admin").style.display = "none";
+  document.getElementById("nav-links-teacher").style.display = "none";
+  document.getElementById("nav-links-student").style.display = "none";
+
   if (!currentUser) return;
-  document.getElementById("user-name-display").textContent = currentUser.full_name;
 
-  const roleBadge = document.getElementById("user-role-badge");
-  const navAdmin = document.getElementById("nav-links-admin");
-  const navTeacher = document.getElementById("nav-links-teacher");
-  const navStudent = document.getElementById("nav-links-student");
-  const subtitle = document.getElementById("nav-portal-subtitle");
+  const roleDisplay = document.getElementById("user-role-badge");
+  const nameDisplay = document.getElementById("user-name-display");
+  const iconDisplay = document.getElementById("user-role-icon");
+  const subtitleDisplay = document.getElementById("nav-portal-subtitle");
 
-  navAdmin.style.display = "none";
-  navTeacher.style.display = "none";
-  navStudent.style.display = "none";
+  nameDisplay.textContent = currentUser.full_name || currentUser.username || "User";
 
   if (currentUser.role === "admin") {
-    document.getElementById("user-role-icon").textContent = "🛡️";
-    roleBadge.textContent = "Administrator";
-    roleBadge.className = "badge badge-neutral";
-    navAdmin.style.display = "flex";
-    subtitle.textContent = "Administrator Portal";
+    document.getElementById("nav-links-admin").style.display = "flex";
+    roleDisplay.textContent = "Admin";
+    roleDisplay.className = "badge badge-neutral";
+    iconDisplay.textContent = "⚙️";
+    subtitleDisplay.textContent = "Administrator Portal";
   } else if (currentUser.role === "student") {
-    document.getElementById("user-role-icon").textContent = "🎓";
-    roleBadge.textContent = "Student";
-    roleBadge.className = "badge badge-green";
-    navStudent.style.display = "flex";
-    subtitle.textContent = "Student Space";
+    document.getElementById("nav-links-student").style.display = "flex";
+    roleDisplay.textContent = "Student";
+    roleDisplay.className = "badge badge-green";
+    iconDisplay.textContent = "🎓";
+    subtitleDisplay.textContent = "Student Reflection Space";
   } else {
-    document.getElementById("user-role-icon").textContent = "👩‍🏫";
-    roleBadge.textContent = currentUser.assigned_classes || "Classroom Teacher";
-    roleBadge.className = "badge badge-neutral";
-    navTeacher.style.display = "flex";
-    subtitle.textContent = "Teacher Portal";
+    document.getElementById("nav-links-teacher").style.display = "flex";
+    roleDisplay.textContent = "Teacher";
+    roleDisplay.className = "badge badge-primary";
+    iconDisplay.textContent = "👩‍🏫";
+    subtitleDisplay.textContent = "Educator Portal";
   }
 }
 
-// ----------------- Initial Setup & Auth Handlers -----------------
+// ─────────────────────────────────────────────
+//  Authentication Handlers
+// ─────────────────────────────────────────────
 
-async function handleInitialSetup(e) {
+function selectLoginAction(action) {
+  document.getElementById("tab-action-signin").classList.toggle("active", action === "signin");
+  document.getElementById("tab-action-create").classList.toggle("active", action === "create");
+  document.getElementById("login-signin-panel").style.display = action === "signin" ? "block" : "none";
+  document.getElementById("login-create-panel").style.display = action === "create" ? "block" : "none";
+}
+
+function openForgotPasswordModal() {
+  document.getElementById("forgot-identifier").value = "";
+  const message = document.getElementById("forgot-password-message");
+  message.style.display = "none";
+  document.getElementById("modal-forgot-password").style.display = "flex";
+}
+
+function closeForgotPasswordModal() {
+  document.getElementById("modal-forgot-password").style.display = "none";
+}
+
+async function handleForgotPassword(e) {
   e.preventDefault();
-  const errorEl = document.getElementById("setup-error");
-  errorEl.style.display = "none";
-
-  const full_name = document.getElementById("setup-name").value.trim();
-  const email = document.getElementById("setup-email").value.trim();
-  const password = document.getElementById("setup-password").value;
-
+  const identifier = document.getElementById("forgot-identifier").value.trim();
+  const message = document.getElementById("forgot-password-message");
   try {
-    const data = await apiFetch("/api/auth/setup", {
+    const res = await apiFetch("/api/auth/forgot-password", {
       method: "POST",
-      body: JSON.stringify({ full_name, email, password })
+      body: JSON.stringify({ identifier })
     });
-
-    authToken = data.access_token;
-    currentUser = data.user;
-    localStorage.setItem("mindmate_token", authToken);
-
-    updateNavForUser();
-    navigate("admin-dashboard");
+    message.className = "alert-box";
+    message.textContent = res.message;
+    message.style.display = "block";
   } catch (err) {
-    errorEl.textContent = err.message || "Failed to set up administrator.";
-    errorEl.style.display = "block";
+    message.className = "alert-box alert-urgent";
+    message.textContent = err.message;
+    message.style.display = "block";
+  }
+}
+
+function selectLoginPortal(portal) {
+  document.getElementById("tab-portal-teacher").classList.remove("active");
+  document.getElementById("tab-portal-student").classList.remove("active");
+  document.getElementById("tab-portal-admin").classList.remove("active");
+
+  const tabBtn = document.getElementById(`tab-portal-${portal}`);
+  if (tabBtn) tabBtn.classList.add("active");
+
+  document.getElementById("login-portal").value = portal;
+  const labelEl = document.getElementById("login-identifier-label");
+  const inputEl = document.getElementById("login-identifier");
+  const hintEl = document.getElementById("login-identifier-hint");
+  const submitBtn = document.getElementById("login-submit-btn");
+  const errorBox = document.getElementById("login-error");
+  errorBox.style.display = "none";
+
+  if (portal === "student") {
+    labelEl.textContent = "Student Username";
+    inputEl.placeholder = "e.g. maya9a";
+    hintEl.style.display = "block";
+    submitBtn.textContent = "Sign In as Student →";
+  } else if (portal === "admin") {
+    labelEl.textContent = "Administrator Email Address";
+    inputEl.placeholder = "admin@school.edu";
+    hintEl.style.display = "none";
+    submitBtn.textContent = "Sign In as Administrator →";
+  } else {
+    labelEl.textContent = "Educator Email Address";
+    inputEl.placeholder = "teacher@school.edu";
+    hintEl.style.display = "none";
+    submitBtn.textContent = "Sign In as Educator →";
   }
 }
 
 async function handleLogin(e) {
   e.preventDefault();
-  const errorEl = document.getElementById("login-error");
-  errorEl.style.display = "none";
+  const errorBox = document.getElementById("login-error");
+  errorBox.style.display = "none";
 
-  const email = document.getElementById("login-email").value.trim();
+  const portal = document.getElementById("login-portal").value;
+  const identifier = document.getElementById("login-identifier").value.trim();
   const password = document.getElementById("login-password").value;
 
   try {
-    const data = await apiFetch("/api/auth/login", {
+    const res = await apiFetch("/api/auth/login", {
       method: "POST",
-      body: JSON.stringify({ email, password })
+      body: JSON.stringify({ identifier, password, portal })
     });
 
-    authToken = data.access_token;
-    currentUser = data.user;
-    localStorage.setItem("mindmate_token", authToken);
+    authToken = res.access_token;
+    currentUser = res.user;
 
+    document.getElementById("login-password").value = "";
     updateNavForUser();
+
+    // Check if mandatory password change is required
+    if (currentUser.must_change_password) {
+      document.getElementById("modal-force-change-password").style.display = "flex";
+      return;
+    }
+
     navigateHome();
   } catch (err) {
-    errorEl.textContent = err.message || "Incorrect email or password.";
-    errorEl.style.display = "block";
+    errorBox.textContent = err.message;
+    errorBox.style.display = "block";
+  }
+}
+
+async function handleForceChangePassword(e) {
+  e.preventDefault();
+  const newPwd = document.getElementById("force-new-password").value;
+  const confirmPwd = document.getElementById("force-confirm-password").value;
+  const errBox = document.getElementById("force-password-error");
+  errBox.style.display = "none";
+
+  if (newPwd !== confirmPwd) {
+    errBox.textContent = "New passwords do not match.";
+    errBox.style.display = "block";
+    return;
+  }
+
+  try {
+    await apiFetch("/api/auth/force-change-password", {
+      method: "POST",
+      body: JSON.stringify({ new_password: newPwd })
+    });
+    document.getElementById("modal-force-change-password").style.display = "none";
+    currentUser.must_change_password = 0;
+    navigateHome();
+  } catch (err) {
+    errBox.textContent = err.message;
+    errBox.style.display = "block";
   }
 }
 
 function logout() {
   authToken = null;
   currentUser = null;
-  localStorage.removeItem("mindmate_token");
+  activeAdaptiveSessionId = null;
+  currentQuestionData = null;
+  document.getElementById("login-identifier").value = "";
+  document.getElementById("login-password").value = "";
   navigate("login");
 }
 
@@ -300,94 +378,100 @@ async function handleChangePassword(e) {
   e.preventDefault();
   const current_password = document.getElementById("change-current-password").value;
   const new_password = document.getElementById("change-new-password").value;
-  const errorEl = document.getElementById("change-password-error");
+  const errorBox = document.getElementById("change-password-error");
+  errorBox.style.display = "none";
 
   try {
     await apiFetch("/api/auth/change-password", {
       method: "POST",
       body: JSON.stringify({ current_password, new_password })
     });
-    alert("Password updated successfully.");
     closeChangePasswordModal();
+    alert("Password updated successfully.");
   } catch (err) {
-    errorEl.textContent = err.message;
-    errorEl.style.display = "block";
+    errorBox.textContent = err.message;
+    errorBox.style.display = "block";
   }
 }
 
-// ----------------- Admin Section -----------------
+// ─────────────────────────────────────────────
+//  Admin Management (Teachers, Students, Assignments, Settings)
+// ─────────────────────────────────────────────
+
+let adminTeachersList = [];
+let adminStudentsList = [];
 
 async function loadAdminDashboard() {
   try {
-    const stats = await apiFetch("/api/dashboard");
-    document.getElementById("admin-stat-teachers").textContent = stats.total_teachers;
-    document.getElementById("admin-stat-students").textContent = stats.total_students;
-    document.getElementById("admin-stat-classes").textContent = `${stats.total_classes} class${stats.total_classes === 1 ? '' : 'es'} enrolled`;
-    document.getElementById("admin-stat-records").textContent = `${stats.total_assessments} / ${stats.total_checkins}`;
-    document.getElementById("admin-stat-alerts").textContent = `${stats.total_observations} / ${stats.open_alerts_count}`;
+    const data = await apiFetch("/api/dashboard");
+    document.getElementById("admin-stat-teachers").textContent = data.total_teachers;
+    document.getElementById("admin-stat-students").textContent = data.total_students;
+    document.getElementById("admin-stat-classes").textContent = `${data.total_classes} classes enrolled`;
+
+    const assignedCount = data.total_students - (data.unassigned_students || 0);
+    document.getElementById("admin-stat-assigned").textContent = `${assignedCount} / ${data.unassigned_students || 0}`;
+    document.getElementById("admin-stat-assigned-sub").textContent = `${data.unassigned_students || 0} unassigned`;
+
+    document.getElementById("admin-stat-checkins").textContent = data.total_checkins;
+    document.getElementById("admin-stat-alerts-sub").textContent = `${data.open_alerts_count} open alerts`;
+
+    // Aggregated Well-being distribution (Admin sees aggregated numbers only)
+    const dist = data.wellbeing_distribution || {};
+    document.getElementById("admin-dist-well").textContent = dist["Doing Well"] || dist["Thriving"] || 0;
+    document.getElementById("admin-dist-moderate").textContent = dist["Moderate Concern"] || dist["Doing okay"] || 0;
+    document.getElementById("admin-dist-attention").textContent = dist["Needs Attention"] || dist["May benefit from support"] || 0;
+    document.getElementById("admin-dist-nodata").textContent = dist["No data"] || 0;
   } catch (err) {
-    console.error("Admin dashboard error:", err);
+    console.error("Error loading admin dashboard:", err);
   }
 }
 
-let adminTeachersCache = [];
-
 async function loadAdminTeachers() {
   try {
-    adminTeachersCache = await apiFetch("/api/admin/teachers");
-    renderAdminTeachersTable(adminTeachersCache);
+    adminTeachersList = await apiFetch("/api/admin/teachers");
+    renderAdminTeachers(adminTeachersList);
   } catch (err) {
     console.error("Error loading teachers:", err);
   }
 }
 
-function filterAdminTeachers() {
-  const query = document.getElementById("admin-teacher-search").value.toLowerCase().trim();
-  const filtered = adminTeachersCache.filter(t => {
-    return t.full_name.toLowerCase().includes(query) || t.email.toLowerCase().includes(query) || (t.assigned_classes || "").toLowerCase().includes(query);
-  });
-  renderAdminTeachersTable(filtered);
-}
-
-function renderAdminTeachersTable(teachers) {
+function renderAdminTeachers(teachers) {
   const tbody = document.getElementById("admin-teachers-table-body");
+  const emptyBox = document.getElementById("admin-teachers-empty");
+  const tableWrap = document.getElementById("admin-teachers-table-wrap");
+
   if (!teachers || teachers.length === 0) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="6">
-          <div class="empty-state">
-            <span class="empty-state-icon">👩‍🏫</span>
-            <div class="empty-state-title">No Teachers Added Yet</div>
-            <p class="empty-state-desc">Create teacher accounts with email credentials and assigned classes so they can access MindMate.</p>
-            <button class="btn btn-primary btn-sm" onclick="openAddTeacherModal()">+ Add First Teacher</button>
-          </div>
-        </td>
-      </tr>
-    `;
+    emptyBox.style.display = "block";
+    tableWrap.style.display = "none";
     return;
   }
 
+  emptyBox.style.display = "none";
+  tableWrap.style.display = "block";
+
   tbody.innerHTML = teachers.map(t => `
-    <tr style="${t.is_active ? '' : 'opacity: 0.6;'}">
+    <tr>
       <td>
-        <strong>${escapeHtml(t.full_name)}</strong>
+        <div style="font-weight: 600; color: var(--text-main);">${escapeHtml(t.full_name)}</div>
         <div style="font-size: 0.8rem; color: var(--text-muted);">${escapeHtml(t.email)}</div>
       </td>
       <td>
-        ${t.assigned_classes ? t.assigned_classes.split(',').map(c => `<span class="badge badge-neutral" style="margin-right:3px;">${escapeHtml(c.trim())}</span>`).join('') : '<span style="color:var(--text-dim);">No classes assigned</span>'}
+        <span class="badge badge-neutral">${escapeHtml(t.assigned_classes || "None")}</span>
       </td>
-      <td><span style="font-family: monospace;">${escapeHtml(t.kiosk_pin || '1234')}</span></td>
-      <td>${t.student_count || 0} students</td>
       <td>
-        <span class="badge ${t.is_active ? 'badge-green' : 'badge-coral'}">
-          ${t.is_active ? 'Active' : 'Deactivated'}
+        <span style="font-family: monospace; font-size: 0.9rem;">${escapeHtml(t.check_in_pin || "1234")}</span>
+      </td>
+      <td><strong>${t.student_count || 0}</strong> assigned</td>
+      <td>
+        <span class="badge ${t.is_active ? 'badge-green' : 'badge-neutral'}">
+          ${t.is_active ? 'Active' : 'Inactive'}
         </span>
       </td>
       <td>
         <div style="display: flex; gap: 0.35rem;">
-          <button class="btn btn-outline btn-sm" onclick="openEditTeacherModal(${t.id})">Edit</button>
-          <button class="btn btn-outline btn-sm" onclick="openResetPasswordModal(${t.id}, 'teacher', '${escapeHtml(t.full_name)}')">Reset Password</button>
-          <button class="btn ${t.is_active ? 'btn-coral' : 'btn-green'} btn-sm" onclick="toggleTeacherStatus(${t.id})">
+          <button class="btn btn-outline btn-sm" onclick="editTeacher(${t.id})">Edit</button>
+          <button class="btn btn-outline btn-sm" onclick="openResetPasswordModal(${t.id}, 'teacher', '${escapeHtml(t.full_name)}')">Reset Pwd</button>
+          <button class="btn btn-outline btn-sm" onclick="toggleTeacherActive(${t.id})">
             ${t.is_active ? 'Deactivate' : 'Activate'}
           </button>
         </div>
@@ -396,30 +480,36 @@ function renderAdminTeachersTable(teachers) {
   `).join("");
 }
 
+function filterAdminTeachers() {
+  const q = document.getElementById("admin-teacher-search").value.toLowerCase();
+  const filtered = adminTeachersList.filter(t =>
+    t.full_name.toLowerCase().includes(q) || t.email.toLowerCase().includes(q)
+  );
+  renderAdminTeachers(filtered);
+}
+
 function openAddTeacherModal() {
   document.getElementById("modal-teacher-title").textContent = "Add Teacher Account";
   document.getElementById("teacher-form-id").value = "";
   document.getElementById("teacher-form-name").value = "";
   document.getElementById("teacher-form-email").value = "";
   document.getElementById("teacher-form-password").value = "";
-  document.getElementById("teacher-form-password").required = true;
   document.getElementById("teacher-password-group").style.display = "block";
   document.getElementById("teacher-form-classes").value = "";
   document.getElementById("teacher-form-pin").value = "1234";
   document.getElementById("modal-teacher").style.display = "flex";
 }
 
-function openEditTeacherModal(id) {
-  const t = adminTeachersCache.find(x => x.id === id);
+function editTeacher(id) {
+  const t = adminTeachersList.find(x => x.id === id);
   if (!t) return;
   document.getElementById("modal-teacher-title").textContent = "Edit Teacher Account";
   document.getElementById("teacher-form-id").value = t.id;
   document.getElementById("teacher-form-name").value = t.full_name;
   document.getElementById("teacher-form-email").value = t.email;
   document.getElementById("teacher-password-group").style.display = "none";
-  document.getElementById("teacher-form-password").required = false;
   document.getElementById("teacher-form-classes").value = t.assigned_classes || "";
-  document.getElementById("teacher-form-pin").value = t.kiosk_pin || "1234";
+  document.getElementById("teacher-form-pin").value = t.check_in_pin || "1234";
   document.getElementById("modal-teacher").style.display = "flex";
 }
 
@@ -433,19 +523,19 @@ async function saveTeacher(e) {
   const full_name = document.getElementById("teacher-form-name").value.trim();
   const email = document.getElementById("teacher-form-email").value.trim();
   const assigned_classes = document.getElementById("teacher-form-classes").value.trim();
-  const kiosk_pin = document.getElementById("teacher-form-pin").value.trim();
+  const check_in_pin = document.getElementById("teacher-form-pin").value.trim();
 
   try {
     if (id) {
       await apiFetch(`/api/admin/teachers/${id}`, {
         method: "PUT",
-        body: JSON.stringify({ full_name, email, assigned_classes, kiosk_pin, is_active: true })
+        body: JSON.stringify({ full_name, email, assigned_classes, check_in_pin, is_active: true })
       });
     } else {
       const password = document.getElementById("teacher-form-password").value;
       await apiFetch("/api/admin/teachers", {
         method: "POST",
-        body: JSON.stringify({ full_name, email, password, assigned_classes, kiosk_pin })
+        body: JSON.stringify({ full_name, email, password, assigned_classes, check_in_pin })
       });
     }
     closeTeacherModal();
@@ -455,144 +545,134 @@ async function saveTeacher(e) {
   }
 }
 
-async function toggleTeacherStatus(teacherId) {
+async function toggleTeacherActive(id) {
   try {
-    await apiFetch(`/api/admin/teachers/${teacherId}/toggle-status`, { method: "POST" });
+    await apiFetch(`/api/admin/teachers/${id}/toggle-status`, { method: "POST" });
     loadAdminTeachers();
   } catch (err) {
     alert(err.message);
   }
 }
 
-// Admin Students Management
-let adminStudentsCache = [];
-
 async function loadAdminStudents() {
   try {
-    const [students, teachers] = await Promise.all([
-      apiFetch("/api/admin/students"),
-      apiFetch("/api/admin/teachers")
-    ]);
-    adminStudentsCache = students;
-
-    // Populate teacher dropdown in student modal
-    const teacherSelect = document.getElementById("admin-student-form-teacher");
-    teacherSelect.innerHTML = `<option value="">None / Open to Class</option>` + teachers.map(t => `<option value="${t.id}">${escapeHtml(t.full_name)} (${escapeHtml(t.assigned_classes || 'All')})</option>`).join("");
-
-    // Populate class filter
-    const classes = Array.from(new Set(students.map(s => s.class_name).filter(Boolean))).sort();
-    const classFilter = document.getElementById("admin-student-class-filter");
-    classFilter.innerHTML = `<option value="">All Classes</option>` + classes.map(c => `<option value="${c}">${c}</option>`).join("");
-
-    renderAdminStudentsTable(adminStudentsCache);
+    adminStudentsList = await apiFetch("/api/admin/students");
+    updateAdminClassFilterOptions();
+    renderAdminStudents(adminStudentsList);
   } catch (err) {
-    console.error("Error loading admin students:", err);
+    console.error("Error loading students:", err);
   }
 }
 
-function filterAdminStudents() {
-  const query = document.getElementById("admin-student-search").value.toLowerCase().trim();
-  const classFilter = document.getElementById("admin-student-class-filter").value;
-
-  const filtered = adminStudentsCache.filter(s => {
-    if (classFilter && s.class_name !== classFilter) return false;
-    if (query) {
-      const matchName = s.name.toLowerCase().includes(query);
-      const matchEmail = (s.student_email || "").toLowerCase().includes(query);
-      return matchName || matchEmail;
-    }
-    return true;
-  });
-  renderAdminStudentsTable(filtered);
+function updateAdminClassFilterOptions() {
+  const classes = Array.from(new Set(adminStudentsList.map(s => s.class_name).filter(Boolean))).sort();
+  const sel = document.getElementById("admin-student-class-filter");
+  if (!sel) return;
+  const currentVal = sel.value;
+  sel.innerHTML = `<option value="">All Classes</option>` +
+    classes.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  sel.value = currentVal;
 }
 
-function renderAdminStudentsTable(students) {
+function renderAdminStudents(students) {
   const tbody = document.getElementById("admin-students-table-body");
+  const emptyBox = document.getElementById("admin-students-empty");
+  const tableWrap = document.getElementById("admin-students-table-wrap");
+
   if (!students || students.length === 0) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="7">
-          <div class="empty-state">
-            <span class="empty-state-icon">👥</span>
-            <div class="empty-state-title">No Students Enrolled Yet</div>
-            <p class="empty-state-desc">Add real students to classes, assign their teachers, and optionally grant student portal logins.</p>
-            <button class="btn btn-primary btn-sm" onclick="openAdminAddStudentModal()">+ Enroll First Student</button>
-          </div>
-        </td>
-      </tr>
-    `;
+    emptyBox.style.display = "block";
+    tableWrap.style.display = "none";
     return;
   }
 
+  emptyBox.style.display = "none";
+  tableWrap.style.display = "block";
+
   tbody.innerHTML = students.map(s => `
-    <tr style="${s.is_archived ? 'opacity: 0.6;' : ''}">
+    <tr>
       <td>
-        <strong>${escapeHtml(s.name)}</strong>
-        <div style="font-size: 0.75rem; color: var(--text-dim);">Added on ${new Date(s.created_at).toLocaleDateString()}</div>
+        <div style="font-weight: 600; color: var(--text-main);">${escapeHtml(s.name)}</div>
       </td>
+      <td><strong>${escapeHtml(s.roll_number || "—")}</strong></td>
       <td><span class="badge badge-neutral">${escapeHtml(s.class_name)}</span></td>
-      <td>${s.teacher_name ? escapeHtml(s.teacher_name) : '<span style="color:var(--text-dim);">Open</span>'}</td>
       <td>
-        <div>${escapeHtml(s.guardian_name)}</div>
-        <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(s.guardian_contact)}</div>
+        ${s.teacher_name ? `<span style="color: var(--primary); font-weight: 500;">${escapeHtml(s.teacher_name)}</span>` : `<span style="color: var(--status-coral); font-size: 0.8rem;">⚠️ Unassigned</span>`}
       </td>
       <td>
-        ${s.student_email ? `
-          <div style="font-size: 0.85rem;">${escapeHtml(s.student_email)}</div>
-          <span class="badge ${s.user_active ? 'badge-green' : 'badge-coral'}" style="font-size: 0.7rem;">
-            ${s.user_active ? 'Login Active' : 'Login Inactive'}
-          </span>
-        ` : '<span style="color:var(--text-dim); font-size:0.8rem;">No login created</span>'}
+        ${s.student_username ? `<code style="font-family: monospace;">${escapeHtml(s.student_username)}</code>` : `<span style="color: var(--text-dim); font-size: 0.8rem;">No login</span>`}
+      </td>
+      <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(s.guardian_contact)}</span></td>
+      <td>
+        <span class="badge ${s.user_active ? 'badge-green' : 'badge-neutral'}">
+          ${s.user_active ? 'Active' : 'Inactive'}
+        </span>
       </td>
       <td>
-        ${s.is_archived ? '<span class="badge badge-coral">Archived</span>' : '<span class="badge badge-green">Enrolled</span>'}
-      </td>
-      <td>
-        <div style="display: flex; gap: 0.35rem; flex-wrap: wrap;">
-          <button class="btn btn-outline btn-sm" onclick="openAdminEditStudentModal(${s.id})">Edit</button>
-          ${s.user_id ? `
-            <button class="btn btn-outline btn-sm" onclick="openResetPasswordModal(${s.id}, 'student', '${escapeHtml(s.name)}')">Reset Login</button>
-            <button class="btn ${s.user_active ? 'btn-coral' : 'btn-green'} btn-sm" onclick="toggleStudentLoginStatus(${s.id})">
-              ${s.user_active ? 'Deactivate Login' : 'Activate Login'}
-            </button>
-          ` : ''}
-          <button class="btn ${s.is_archived ? 'btn-green' : 'btn-coral'} btn-sm" onclick="toggleArchiveStudent(${s.id}, true)">
-            ${s.is_archived ? 'Unarchive' : 'Archive'}
-          </button>
+        <div style="display: flex; gap: 0.35rem;">
+          <button class="btn btn-outline btn-sm" onclick="editAdminStudent(${s.id})">Edit</button>
+          ${s.user_id ? `<button class="btn btn-outline btn-sm" onclick="openResetPasswordModal(${s.id}, 'student', '${escapeHtml(s.name)}')">Reset Pwd</button>` : ''}
+          ${s.user_id ? `<button class="btn btn-outline btn-sm" onclick="toggleAdminStudentActive(${s.id})">${s.user_active ? 'Deactivate' : 'Activate'}</button>` : ''}
         </div>
       </td>
     </tr>
   `).join("");
 }
 
-function openAdminAddStudentModal() {
+function filterAdminStudents() {
+  const q = document.getElementById("admin-student-search").value.toLowerCase();
+  const classFilter = document.getElementById("admin-student-class-filter").value;
+  const filtered = adminStudentsList.filter(s => {
+    const matchesQ = s.name.toLowerCase().includes(q) || (s.roll_number && s.roll_number.toLowerCase().includes(q));
+    const matchesClass = !classFilter || s.class_name === classFilter;
+    return matchesQ && matchesClass;
+  });
+  renderAdminStudents(filtered);
+}
+
+async function populateTeacherDropdown(selectElementId, selectedTeacherId = null) {
+  const sel = document.getElementById(selectElementId);
+  if (!sel) return;
+  try {
+    const teachers = await apiFetch("/api/admin/teachers");
+    sel.innerHTML = `<option value="">None (Unassigned)</option>` +
+      teachers.filter(t => t.is_active).map(t =>
+        `<option value="${t.id}" ${t.id === selectedTeacherId ? 'selected' : ''}>${escapeHtml(t.full_name)} (${escapeHtml(t.assigned_classes || 'All')})</option>`
+      ).join("");
+  } catch (err) {
+    console.error("Error fetching teachers for dropdown:", err);
+  }
+}
+
+async function openAdminAddStudentModal() {
   document.getElementById("modal-admin-student-title").textContent = "Enroll Student";
   document.getElementById("admin-student-form-id").value = "";
   document.getElementById("admin-student-form-name").value = "";
+  document.getElementById("admin-student-form-roll").value = "";
   document.getElementById("admin-student-form-class").value = "";
   document.getElementById("admin-student-form-guardian").value = "";
   document.getElementById("admin-student-form-contact").value = "";
   document.getElementById("admin-student-form-consent").checked = true;
-  document.getElementById("admin-student-form-email").value = "";
+  document.getElementById("admin-student-form-username").value = "";
   document.getElementById("admin-student-form-password").value = "";
-  document.getElementById("admin-student-credentials-section").style.display = "block";
+  document.getElementById("admin-student-password-group").style.display = "block";
+  await populateTeacherDropdown("admin-student-form-teacher");
   document.getElementById("modal-admin-student").style.display = "flex";
 }
 
-function openAdminEditStudentModal(id) {
-  const s = adminStudentsCache.find(x => x.id === id);
+async function editAdminStudent(id) {
+  const s = adminStudentsList.find(x => x.id === id);
   if (!s) return;
   document.getElementById("modal-admin-student-title").textContent = "Edit Student";
   document.getElementById("admin-student-form-id").value = s.id;
   document.getElementById("admin-student-form-name").value = s.name;
+  document.getElementById("admin-student-form-roll").value = s.roll_number || "";
   document.getElementById("admin-student-form-class").value = s.class_name;
-  document.getElementById("admin-student-form-teacher").value = s.assigned_teacher_id || "";
   document.getElementById("admin-student-form-guardian").value = s.guardian_name;
   document.getElementById("admin-student-form-contact").value = s.guardian_contact;
-  document.getElementById("admin-student-form-consent").checked = (s.consent_given === 1);
-  document.getElementById("admin-student-form-email").value = s.student_email || "";
-  document.getElementById("admin-student-credentials-section").style.display = s.user_id ? "block" : "none";
+  document.getElementById("admin-student-form-consent").checked = Boolean(s.consent_given);
+  document.getElementById("admin-student-form-username").value = s.student_username || "";
   document.getElementById("admin-student-password-group").style.display = "none";
+  await populateTeacherDropdown("admin-student-form-teacher", s.assigned_teacher_id);
   document.getElementById("modal-admin-student").style.display = "flex";
 }
 
@@ -604,25 +684,31 @@ async function saveAdminStudent(e) {
   e.preventDefault();
   const id = document.getElementById("admin-student-form-id").value;
   const name = document.getElementById("admin-student-form-name").value.trim();
+  const roll_number = document.getElementById("admin-student-form-roll").value.trim();
   const class_name = document.getElementById("admin-student-form-class").value.trim();
-  const teacherVal = document.getElementById("admin-student-form-teacher").value;
-  const assigned_teacher_id = teacherVal ? parseInt(teacherVal) : null;
+  const assigned_teacher_id = document.getElementById("admin-student-form-teacher").value || null;
   const guardian_name = document.getElementById("admin-student-form-guardian").value.trim();
   const guardian_contact = document.getElementById("admin-student-form-contact").value.trim();
   const consent_given = document.getElementById("admin-student-form-consent").checked;
-  const email = document.getElementById("admin-student-form-email").value.trim();
+  const username = document.getElementById("admin-student-form-username").value.trim();
 
   try {
     if (id) {
       await apiFetch(`/api/admin/students/${id}`, {
         method: "PUT",
-        body: JSON.stringify({ name, class_name, assigned_teacher_id, guardian_name, guardian_contact, consent_given, email: email || null })
+        body: JSON.stringify({
+          name, roll_number, class_name, assigned_teacher_id: assigned_teacher_id ? parseInt(assigned_teacher_id) : null,
+          guardian_name, guardian_contact, consent_given, username: username || null
+        })
       });
     } else {
       const password = document.getElementById("admin-student-form-password").value;
       await apiFetch("/api/admin/students", {
         method: "POST",
-        body: JSON.stringify({ name, class_name, assigned_teacher_id, guardian_name, guardian_contact, consent_given, email: email || null, password: password || null })
+        body: JSON.stringify({
+          name, roll_number, class_name, assigned_teacher_id: assigned_teacher_id ? parseInt(assigned_teacher_id) : null,
+          guardian_name, guardian_contact, consent_given, username: username || null, password: password || null
+        })
       });
     }
     closeAdminStudentModal();
@@ -632,190 +718,295 @@ async function saveAdminStudent(e) {
   }
 }
 
-async function toggleStudentLoginStatus(studentId) {
+async function toggleAdminStudentActive(id) {
   try {
-    await apiFetch(`/api/admin/students/${studentId}/toggle-status`, { method: "POST" });
+    await apiFetch(`/api/admin/students/${id}/toggle-status`, { method: "POST" });
     loadAdminStudents();
   } catch (err) {
     alert(err.message);
   }
 }
 
-function openResetPasswordModal(targetId, targetType, targetName) {
-  document.getElementById("reset-target-id").value = targetId;
-  document.getElementById("reset-target-type").value = targetType;
-  document.getElementById("reset-target-name").textContent = `Setting new password for ${targetType}: "${targetName}".`;
-  document.getElementById("reset-new-password").value = "";
-  document.getElementById("modal-reset-password").style.display = "flex";
+// ─────────────────────────────────────────────
+//  Assignments & Bulk Reassignment
+// ─────────────────────────────────────────────
+
+async function loadAdminAssignmentsView() {
+  try {
+    const unassigned = await apiFetch("/api/admin/unassigned-students");
+    document.getElementById("unassigned-count-badge").textContent = unassigned.length;
+    const container = document.getElementById("unassigned-students-list");
+    if (unassigned.length === 0) {
+      container.innerHTML = `<div class="empty-state-box" style="margin: 0;">All enrolled students have an assigned primary mentor!</div>`;
+    } else {
+      container.innerHTML = unassigned.map(s => `
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.65rem 0; border-bottom: 1px solid var(--border-color);">
+          <div>
+            <div style="font-weight: 600;">${escapeHtml(s.name)} (Roll ${escapeHtml(s.roll_number || '—')})</div>
+            <div style="font-size: 0.78rem; color: var(--text-muted);">${escapeHtml(s.class_name)}</div>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="editAdminStudent(${s.id})">Assign Mentor</button>
+        </div>
+      `).join("");
+    }
+
+    // Teacher workload
+    const teachers = await apiFetch("/api/admin/teachers");
+    const workloadContainer = document.getElementById("teacher-workload-list");
+    workloadContainer.innerHTML = teachers.map(t => `
+      <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.65rem 0; border-bottom: 1px solid var(--border-color);">
+        <div>
+          <div style="font-weight: 600;">${escapeHtml(t.full_name)}</div>
+          <div style="font-size: 0.78rem; color: var(--text-muted);">${escapeHtml(t.assigned_classes || 'All classes')}</div>
+        </div>
+        <span class="badge ${t.student_count > 0 ? 'badge-primary' : 'badge-neutral'}">${t.student_count || 0} mentees</span>
+      </div>
+    `).join("");
+  } catch (err) {
+    console.error("Error loading assignments view:", err);
+  }
 }
 
-function closeResetPasswordModal() {
-  document.getElementById("modal-reset-password").style.display = "none";
+async function openBulkAssignModal() {
+  await populateTeacherDropdown("bulk-assign-teacher-select");
+  const students = await apiFetch("/api/admin/students");
+  const container = document.getElementById("bulk-students-checkboxes");
+  container.innerHTML = students.map(s => `
+    <label class="form-checkbox" style="display: flex; justify-content: space-between; padding: 0.35rem 0; font-size: 0.85rem;">
+      <span>
+        <input type="checkbox" name="bulk-student-select" value="${s.id}">
+        <strong>${escapeHtml(s.name)}</strong> (${escapeHtml(s.class_name)})
+      </span>
+      <span style="color: var(--text-dim); font-size: 0.75rem;">Current: ${escapeHtml(s.teacher_name || 'Unassigned')}</span>
+    </label>
+  `).join("");
+  document.getElementById("bulk-assign-reason").value = "";
+  document.getElementById("modal-bulk-assign").style.display = "flex";
 }
 
-async function handleAdminResetPassword(e) {
+function closeBulkAssignModal() {
+  document.getElementById("modal-bulk-assign").style.display = "none";
+}
+
+async function handleBulkAssignSubmit(e) {
   e.preventDefault();
-  const targetId = document.getElementById("reset-target-id").value;
-  const targetType = document.getElementById("reset-target-type").value;
-  const new_password = document.getElementById("reset-new-password").value;
+  const teacherId = document.getElementById("bulk-assign-teacher-select").value;
+  if (!teacherId) {
+    alert("Please select a target mentor teacher.");
+    return;
+  }
+  const checked = Array.from(document.querySelectorAll("input[name='bulk-student-select']:checked"))
+    .map(el => parseInt(el.value));
+  if (checked.length === 0) {
+    alert("Please select at least one student to assign.");
+    return;
+  }
+  const reason = document.getElementById("bulk-assign-reason").value.trim();
 
   try {
-    const endpoint = targetType === "teacher" 
-      ? `/api/admin/teachers/${targetId}/reset-password`
-      : `/api/admin/students/${targetId}/reset-password`;
-
-    const res = await apiFetch(endpoint, {
+    await apiFetch("/api/admin/assignments/bulk", {
       method: "POST",
-      body: JSON.stringify({ new_password })
+      body: JSON.stringify({
+        teacher_id: parseInt(teacherId),
+        student_ids: checked,
+        reason
+      })
     });
-    alert(res.message || "Password successfully reset.");
-    closeResetPasswordModal();
+    closeBulkAssignModal();
+    alert(`Successfully assigned ${checked.length} students.`);
+    loadAdminAssignmentsView();
   } catch (err) {
     alert(err.message);
   }
 }
 
-async function loadAuditLogs() {
+async function loadAssignmentHistoryModal() {
   try {
-    const logs = await apiFetch("/api/admin/audit-logs?limit=50");
-    const tbody = document.getElementById("admin-audit-table-body");
-    if (!logs || logs.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="5"><div class="empty-state"><span class="empty-state-icon">📜</span><div class="empty-state-title">No Audit Logs Yet</div><p class="empty-state-desc">System actions, logins, and well-being record access will be logged here.</p></div></td></tr>`;
-      return;
-    }
-
-    tbody.innerHTML = logs.map(l => {
-      const dateStr = new Date(l.timestamp).toLocaleString();
-      return `
+    const history = await apiFetch("/api/admin/assignment-history");
+    const tbody = document.getElementById("assignment-history-body");
+    if (history.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No assignment changes recorded yet.</td></tr>`;
+    } else {
+      tbody.innerHTML = history.map(h => `
         <tr>
-          <td style="font-size: 0.8rem; color: var(--text-muted); white-space: nowrap;">${dateStr}</td>
-          <td style="font-weight: 500;">${escapeHtml(l.user_email)}</td>
-          <td><span class="badge badge-neutral" style="font-family: monospace;">${escapeHtml(l.action)}</span></td>
-          <td>${escapeHtml(l.resource_type)} ${l.resource_id ? `#${l.resource_id}` : ''}</td>
-          <td style="font-size: 0.85rem;">${escapeHtml(l.details)}</td>
+          <td><span style="font-size: 0.82rem;">${formatDate(h.changed_at)}</span></td>
+          <td><strong>${escapeHtml(h.student_name)}</strong></td>
+          <td>${escapeHtml(h.old_teacher_name || '—')}</td>
+          <td><span style="color: var(--primary); font-weight: 500;">${escapeHtml(h.new_teacher_name || '—')}</span></td>
+          <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(h.reason || '—')}</span></td>
         </tr>
-      `;
-    }).join("");
+      `).join("");
+    }
+    document.getElementById("modal-assignment-history").style.display = "flex";
   } catch (err) {
-    console.error("Failed to load audit logs:", err);
+    alert(err.message);
   }
 }
 
-// ----------------- Teacher Section -----------------
+function closeAssignmentHistoryModal() {
+  document.getElementById("modal-assignment-history").style.display = "none";
+}
+
+// ─────────────────────────────────────────────
+//  Admin Settings
+// ─────────────────────────────────────────────
+
+async function loadAdminSettingsView() {
+  try {
+    const settings = await apiFetch("/api/admin/settings");
+    document.getElementById("set-sg-name").value = settings.safeguarding_contact_name || "";
+    document.getElementById("set-sg-phone").value = settings.safeguarding_contact_phone || "";
+    document.getElementById("set-sg-email").value = settings.safeguarding_contact_email || "";
+    document.getElementById("set-reporting-window").value = settings.reporting_window_days || "30";
+    document.getElementById("set-checkin-frequency").value = settings.checkin_frequency_days || "7";
+  } catch (err) {
+    console.error("Error loading settings:", err);
+  }
+}
+
+async function handleSaveSettings(e) {
+  e.preventDefault();
+  const alertBox = document.getElementById("settings-alert");
+  alertBox.style.display = "none";
+
+  const safeguarding_contact_name = document.getElementById("set-sg-name").value.trim();
+  const safeguarding_contact_phone = document.getElementById("set-sg-phone").value.trim();
+  const safeguarding_contact_email = document.getElementById("set-sg-email").value.trim();
+  const reporting_window_days = parseInt(document.getElementById("set-reporting-window").value) || 30;
+  const checkin_frequency_days = parseInt(document.getElementById("set-checkin-frequency").value) || 7;
+
+  try {
+    await apiFetch("/api/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        safeguarding_contact_name,
+        safeguarding_contact_phone,
+        safeguarding_contact_email,
+        reporting_window_days,
+        checkin_frequency_days
+      })
+    });
+    alertBox.textContent = "Settings updated successfully.";
+    alertBox.style.display = "block";
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Teacher Dashboard & Insights Engine
+// ─────────────────────────────────────────────
 
 async function loadTeacherDashboard() {
   try {
     const data = await apiFetch("/api/dashboard");
-
-    if (data.is_empty) {
-      document.getElementById("dash-total-students").textContent = "0";
-      document.getElementById("dash-class-average").textContent = "0%";
-      document.getElementById("dash-open-alerts").textContent = "0";
-      document.getElementById("attention-list-container").innerHTML = `
-        <div class="empty-state">
-          <span class="empty-state-icon">👥</span>
-          <div class="empty-state-title">No Students Assigned Yet</div>
-          <p class="empty-state-desc">Your account has no students assigned to your classes yet. Contact your administrator or enroll students.</p>
-        </div>
-      `;
-      renderWellbeingChart({"Thriving": 0, "Doing okay": 0, "May benefit from support": 0});
-      return;
-    }
-
     document.getElementById("dash-total-students").textContent = data.total_students;
-    document.getElementById("dash-class-average").textContent = data.class_average_mark + "%";
+    document.getElementById("dash-class-average").textContent = `${data.class_average_mark}%`;
     document.getElementById("dash-open-alerts").textContent = data.open_alerts_count;
 
-    const alertBadge = document.getElementById("nav-alert-badge");
-    if (data.open_alerts_count > 0) {
-      alertBadge.textContent = data.open_alerts_count;
-      alertBadge.style.display = "inline-block";
+    // Well-being Distribution Card
+    const distData = data.wellbeing_distribution;
+    const distEmptyEl = document.getElementById("dash-distribution-empty");
+    const distContentEl = document.getElementById("dash-distribution-content");
+    const distSummaryEl = document.getElementById("dash-distribution-summary");
+    const distPendingEl = document.getElementById("dash-distribution-pending");
+
+    if (!distData || !distData.has_data) {
+      distEmptyEl.style.display = "block";
+      distEmptyEl.textContent = "No assessments completed yet.";
+      distContentEl.style.display = "none";
+      if (distSummaryEl) distSummaryEl.textContent = distData ? distData.summary_text : "Based on 0 assigned students";
+      if (distPendingEl) distPendingEl.textContent = distData ? distData.pending_text : "0 pending";
     } else {
-      alertBadge.style.display = "none";
+      distEmptyEl.style.display = "none";
+      distContentEl.style.display = "block";
+      distSummaryEl.textContent = distData.summary_text;
+      distPendingEl.textContent = distData.pending_text;
+
+      const cats = distData.categories || {};
+      document.getElementById("count-thriving").textContent = cats["Doing Well"] ? `${cats["Doing Well"].count} (${cats["Doing Well"].percentage}%)` : "0 (0%)";
+      document.getElementById("count-okay").textContent = cats["Moderate Concern"] ? `${cats["Moderate Concern"].count} (${cats["Moderate Concern"].percentage}%)` : "0 (0%)";
+      document.getElementById("count-support").textContent = cats["Needs Attention"] ? `${cats["Needs Attention"].count} (${cats["Needs Attention"].percentage}%)` : "0 (0%)";
+
+      renderWellbeingChart(distData.counts);
     }
 
-    const assigned = currentUser.assigned_classes ? currentUser.assigned_classes.split(",").join(" & ") : "assigned classes";
-    document.getElementById("dash-classes-sub").textContent = `Active in ${assigned}`;
+    // Teaching & Learning Insights Card
+    const insights = data.teaching_insights;
+    if (insights) {
+      document.getElementById("insight-understanding").textContent = insights.average_lesson_understanding_pct !== null ? `${insights.average_lesson_understanding_pct}%` : "—";
+      document.getElementById("insight-participation").textContent = insights.classroom_participation_pct !== null ? `${insights.classroom_participation_pct}%` : "—";
 
-    const dist = data.wellbeing_distribution;
-    document.getElementById("count-thriving").textContent = dist["Thriving"] || 0;
-    document.getElementById("count-okay").textContent = dist["Doing okay"] || 0;
-    document.getElementById("count-support").textContent = dist["May benefit from support"] || 0;
+      const pace = insights.teaching_pace_feedback || {};
+      document.getElementById("insight-pace-headline").textContent = pace.just_right ? `${pace.just_right}% Just Right` : (pace.fast ? `${pace.fast}% Fast` : "Steady");
+      document.getElementById("insight-pace-sub").textContent = `${pace.fast || 0}% Fast • ${pace.slow || 0}% Slow`;
 
-    renderWellbeingChart(dist);
+      document.getElementById("insight-support-count").textContent = insights.academic_support_required_count || 0;
 
-    const attentionList = data.students_need_attention || [];
-    const container = document.getElementById("attention-list-container");
-    const countBadge = document.getElementById("attention-count-badge");
-    countBadge.textContent = `${attentionList.length} flagged`;
+      const diffSubjectsEl = document.getElementById("insight-difficult-subjects");
+      if (insights.difficult_subjects && insights.difficult_subjects.length > 0) {
+        diffSubjectsEl.innerHTML = insights.difficult_subjects.map(s =>
+          `<span class="badge badge-coral">${escapeHtml(s.subject)} (${s.count})</span>`
+        ).join("");
+      } else {
+        diffSubjectsEl.innerHTML = `<span style="font-size: 0.85rem; color: var(--text-dim);">No specific subject difficulties flagged.</span>`;
+      }
 
-    if (attentionList.length === 0) {
-      container.innerHTML = `
-        <div class="empty-state">
-          <span class="empty-state-icon">🎉</span>
-          <div class="empty-state-title">All Students on Track</div>
-          <p class="empty-state-desc">All enrolled students in your classes are currently on track and thriving.</p>
-        </div>
-      `;
-    } else {
-      container.innerHTML = attentionList.map(st => `
-        <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.85rem 0.5rem; border-bottom: 1px solid var(--border-color);">
-          <div>
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-              <strong>${escapeHtml(st.name)}</strong>
-              <span class="badge badge-neutral" style="font-size: 0.72rem;">${escapeHtml(st.class_name)}</span>
-              ${st.has_urgent ? `<span class="badge badge-urgent" style="font-size: 0.7rem;">🚨 Urgent</span>` : ''}
-              <span class="badge ${st.badge_class}" style="font-size: 0.72rem;">${st.support_level}</span>
-            </div>
-            <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">
-              ${escapeHtml(st.summary_reason)}
-            </div>
-          </div>
-          <button class="btn btn-outline btn-sm" onclick="viewStudentProfile(${st.id})">Profile →</button>
-        </div>
-      `).join("");
+      const prefMethodsEl = document.getElementById("insight-preferred-methods");
+      if (insights.preferred_learning_methods && insights.preferred_learning_methods.length > 0) {
+        prefMethodsEl.innerHTML = insights.preferred_learning_methods.map(m =>
+          `<span class="badge badge-primary">${escapeHtml(m.method)} (${m.count})</span>`
+        ).join("");
+      } else {
+        prefMethodsEl.innerHTML = `<span style="font-size: 0.85rem; color: var(--text-dim);">No learning preferences recorded yet.</span>`;
+      }
     }
+
+    // Attention List
+    renderAttentionList(data.students_need_attention || []);
   } catch (err) {
-    console.error("Dashboard error:", err);
+    console.error("Error loading teacher dashboard:", err);
   }
 }
 
-function renderWellbeingChart(dist) {
-  const ctx = document.getElementById("wellbeingDistributionChart").getContext("2d");
+function renderWellbeingChart(counts) {
+  const ctx = document.getElementById("wellbeingDistributionChart");
+  if (!ctx) return;
+
   if (wellbeingChartInstance) {
     wellbeingChartInstance.destroy();
   }
 
+  const wellCount = counts["Doing Well"] || 0;
+  const modCount = counts["Moderate Concern"] || 0;
+  const attnCount = counts["Needs Attention"] || 0;
+
   wellbeingChartInstance = new Chart(ctx, {
     type: "bar",
     data: {
-      labels: ["Thriving", "Doing okay", "May benefit support"],
+      labels: ["Doing Well", "Moderate Concern", "Needs Attention"],
       datasets: [{
         label: "Students",
-        data: [
-          dist["Thriving"] || 0,
-          dist["Doing okay"] || 0,
-          dist["May benefit from support"] || 0
-        ],
+        data: [wellCount, modCount, attnCount],
         backgroundColor: [
-          "rgba(16, 185, 129, 0.7)",
-          "rgba(245, 158, 11, 0.7)",
-          "rgba(251, 113, 133, 0.7)"
+          "#10b981", // green
+          "#f59e0b", // amber
+          "#fb7185"  // coral
         ],
-        borderColor: ["#10b981", "#f59e0b", "#fb7185"],
-        borderWidth: 1.5,
-        borderRadius: 8
+        borderRadius: 6
       }]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false }
+      },
       scales: {
         y: {
           beginAtZero: true,
           ticks: { stepSize: 1, color: "#94a3b8" },
-          grid: { color: "rgba(255, 255, 255, 0.05)" }
+          grid: { color: "rgba(255,255,255,0.06)" }
         },
         x: {
           ticks: { color: "#94a3b8" },
@@ -826,174 +1017,129 @@ function renderWellbeingChart(dist) {
   });
 }
 
-// Teacher Students List
-let teacherStudentsCache = [];
+function renderAttentionList(students) {
+  const container = document.getElementById("attention-list-container");
+  const emptyEl = document.getElementById("attention-list-empty");
+  const badge = document.getElementById("attention-count-badge");
+
+  badge.textContent = `${students.length} flagged`;
+
+  if (students.length === 0) {
+    emptyEl.style.display = "block";
+    container.innerHTML = "";
+    return;
+  }
+
+  emptyEl.style.display = "none";
+  container.innerHTML = students.map(s => `
+    <div style="background-color: var(--bg-elevated); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 0.9rem; margin-bottom: 0.65rem;">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.4rem;">
+        <div>
+          <span style="font-weight: 600; cursor: pointer; color: var(--text-main);" onclick="openStudentProfile(${s.id})">
+            ${escapeHtml(s.name)}
+          </span>
+          <span style="font-size: 0.8rem; color: var(--text-muted); margin-left: 0.5rem;">(${escapeHtml(s.class_name)}${s.roll_number ? ` • Roll ${escapeHtml(s.roll_number)}` : ''})</span>
+        </div>
+        <div style="display: flex; gap: 0.4rem; align-items: center;">
+          <span class="badge ${s.follow_up_status === 'resolved' ? 'badge-green' : (s.follow_up_status === 'in_progress' ? 'badge-primary' : 'badge-amber')}">
+            ${escapeHtml(s.follow_up_status || 'New')}
+          </span>
+          <button class="btn btn-outline btn-sm" onclick="openFollowUpModal(${s.id}, '${escapeHtml(s.name)}', '${s.follow_up_status || 'new'}')">Update</button>
+        </div>
+      </div>
+      <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.4;">
+        ${escapeHtml(s.summary_reason || 'Requires teacher review.')}
+      </div>
+    </div>
+  `).join("");
+}
+
+// ─────────────────────────────────────────────
+//  Teacher Students List & Profile
+// ─────────────────────────────────────────────
+
+let teacherStudentsList = [];
 
 async function loadTeacherStudents() {
   try {
-    const [classes, students] = await Promise.all([
-      apiFetch("/api/classes"),
-      apiFetch("/api/students?include_archived=true")
-    ]);
-    teacherStudentsCache = students;
-
-    const classSelect = document.getElementById("teacher-class-filter");
-    const modalClassSelect = document.getElementById("teacher-student-form-class");
-
-    classSelect.innerHTML = `<option value="">All My Classes</option>` + classes.map(c => `<option value="${c}">${c}</option>`).join("");
-    modalClassSelect.innerHTML = classes.map(c => `<option value="${c}">${c}</option>`).join("");
-
-    renderTeacherStudentsTable(teacherStudentsCache);
+    teacherStudentsList = await apiFetch("/api/students");
+    renderTeacherStudents(teacherStudentsList);
+    populateTeacherClassFilter();
   } catch (err) {
     console.error("Error loading teacher students:", err);
   }
 }
 
-function filterTeacherStudents() {
-  const query = document.getElementById("teacher-student-search").value.toLowerCase().trim();
-  const selectedClass = document.getElementById("teacher-class-filter").value;
-  const includeArchived = document.getElementById("teacher-include-archived").checked;
-
-  const filtered = teacherStudentsCache.filter(st => {
-    if (!includeArchived && st.is_archived) return false;
-    if (selectedClass && st.class_name !== selectedClass) return false;
-    if (query) {
-      const matchName = st.name.toLowerCase().includes(query);
-      const matchGuardian = (st.guardian_name || "").toLowerCase().includes(query);
-      return matchName || matchGuardian;
-    }
-    return true;
-  });
-
-  renderTeacherStudentsTable(filtered);
+function populateTeacherClassFilter() {
+  const classes = Array.from(new Set(teacherStudentsList.map(s => s.class_name).filter(Boolean))).sort();
+  const sel = document.getElementById("teacher-class-filter");
+  if (!sel) return;
+  sel.innerHTML = `<option value="">All My Classes</option>` +
+    classes.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
 }
 
-function renderTeacherStudentsTable(students) {
+function renderTeacherStudents(students) {
   const tbody = document.getElementById("teacher-students-table-body");
+  const emptyBox = document.getElementById("teacher-students-empty");
+  const tableWrap = document.getElementById("teacher-students-table-wrap");
+
   if (!students || students.length === 0) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="7">
-          <div class="empty-state">
-            <span class="empty-state-icon">👥</span>
-            <div class="empty-state-title">No Students Found</div>
-            <p class="empty-state-desc">No students are currently enrolled in your classes matching this filter.</p>
-            <button class="btn btn-primary btn-sm" onclick="openTeacherAddStudentModal()">+ Enroll Student</button>
-          </div>
-        </td>
-      </tr>
-    `;
+    emptyBox.style.display = "block";
+    emptyBox.textContent = "No students are currently assigned to this teacher.";
+    tableWrap.style.display = "none";
     return;
   }
 
-  tbody.innerHTML = students.map(st => {
-    const isArchived = st.is_archived === 1;
-    return `
-      <tr style="${isArchived ? 'opacity: 0.6;' : ''}">
-        <td>
-          <div style="font-weight: 600;">${escapeHtml(st.name)}</div>
-          <div style="font-size: 0.75rem; color: var(--text-dim);">Added on ${new Date(st.created_at).toLocaleDateString()}</div>
-        </td>
-        <td><span class="badge badge-neutral">${escapeHtml(st.class_name)}</span></td>
-        <td>
-          <div>${escapeHtml(st.guardian_name)}</div>
-          <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(st.guardian_contact)}</div>
-        </td>
-        <td>
-          ${st.consent_given ? '<span class="badge badge-green">Consent ✓</span>' : '<span class="badge badge-coral">Pending</span>'}
-        </td>
-        <td>
-          <span class="badge ${st.badge_class}" title="${escapeHtml(st.support_reason || '')}">
-            ${escapeHtml(st.support_level)}
-          </span>
-          <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 2px;">
-            ${escapeHtml(st.support_reason || '')}
-          </div>
-        </td>
-        <td>
-          ${isArchived ? '<span class="badge badge-coral">Archived</span>' : '<span class="badge badge-green">Active</span>'}
-        </td>
-        <td>
-          <div style="display: flex; gap: 0.35rem;">
-            <button class="btn btn-primary btn-sm" onclick="viewStudentProfile(${st.id})">Profile</button>
-            <button class="btn btn-outline btn-sm" onclick="openTeacherEditStudentModal(${st.id})">Edit</button>
-            <button class="btn ${isArchived ? 'btn-green' : 'btn-coral'} btn-sm" onclick="toggleArchiveStudent(${st.id}, false)">
-              ${isArchived ? 'Unarchive' : 'Archive'}
-            </button>
-          </div>
-        </td>
-      </tr>
-    `;
-  }).join("");
+  emptyBox.style.display = "none";
+  tableWrap.style.display = "block";
+
+  tbody.innerHTML = students.map(s => `
+    <tr>
+      <td>
+        <strong style="cursor: pointer; color: var(--primary);" onclick="openStudentProfile(${s.id})">
+          ${escapeHtml(s.name)}
+        </strong>
+      </td>
+      <td><strong>${escapeHtml(s.roll_number || '—')}</strong></td>
+      <td><span class="badge badge-neutral">${escapeHtml(s.class_name)}</span></td>
+      <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(s.guardian_contact)}</span></td>
+      <td>
+        <span class="badge ${s.badge_class || 'badge-neutral'}">
+          ${escapeHtml(s.support_level || 'Doing Well')}
+        </span>
+      </td>
+      <td>
+        <span class="badge ${s.consent_given ? 'badge-green' : 'badge-coral'}">
+          ${s.consent_given ? 'Consent' : 'No Consent'}
+        </span>
+      </td>
+      <td>
+        <button class="btn btn-outline btn-sm" onclick="openStudentProfile(${s.id})">View Profile →</button>
+      </td>
+    </tr>
+  `).join("");
 }
 
-function openTeacherAddStudentModal() {
-  document.getElementById("modal-teacher-student-title").textContent = "Add Student";
-  document.getElementById("teacher-student-form-id").value = "";
-  document.getElementById("teacher-student-form-name").value = "";
-  document.getElementById("teacher-student-form-guardian").value = "";
-  document.getElementById("teacher-student-form-contact").value = "";
-  document.getElementById("teacher-student-form-consent").checked = true;
-  document.getElementById("modal-teacher-student").style.display = "flex";
+function filterTeacherStudents() {
+  const q = document.getElementById("teacher-student-search").value.toLowerCase();
+  const classFilter = document.getElementById("teacher-class-filter").value;
+  const filtered = teacherStudentsList.filter(s => {
+    const matchesQ = s.name.toLowerCase().includes(q) || (s.roll_number && s.roll_number.toLowerCase().includes(q));
+    const matchesClass = !classFilter || s.class_name === classFilter;
+    return matchesQ && matchesClass;
+  });
+  renderTeacherStudents(filtered);
 }
 
-function openTeacherEditStudentModal(id) {
-  const st = teacherStudentsCache.find(s => s.id === id);
-  if (!st) return;
-  document.getElementById("modal-teacher-student-title").textContent = "Edit Student";
-  document.getElementById("teacher-student-form-id").value = st.id;
-  document.getElementById("teacher-student-form-name").value = st.name;
-  document.getElementById("teacher-student-form-class").value = st.class_name;
-  document.getElementById("teacher-student-form-guardian").value = st.guardian_name;
-  document.getElementById("teacher-student-form-contact").value = st.guardian_contact;
-  document.getElementById("teacher-student-form-consent").checked = (st.consent_given === 1);
-  document.getElementById("modal-teacher-student").style.display = "flex";
-}
-
-function closeTeacherStudentModal() {
-  document.getElementById("modal-teacher-student").style.display = "none";
-}
-
-async function saveTeacherStudent(e) {
-  e.preventDefault();
-  const id = document.getElementById("teacher-student-form-id").value;
-  const name = document.getElementById("teacher-student-form-name").value.trim();
-  const class_name = document.getElementById("teacher-student-form-class").value;
-  const guardian_name = document.getElementById("teacher-student-form-guardian").value.trim();
-  const guardian_contact = document.getElementById("teacher-student-form-contact").value.trim();
-  const consent_given = document.getElementById("teacher-student-form-consent").checked;
-
-  const payload = { name, class_name, guardian_name, guardian_contact, consent_given };
-
-  try {
-    if (id) {
-      await apiFetch(`/api/students/${id}`, { method: "PUT", body: JSON.stringify(payload) });
-    } else {
-      await apiFetch("/api/students", { method: "POST", body: JSON.stringify(payload) });
-    }
-    closeTeacherStudentModal();
-    loadTeacherStudents();
-  } catch (err) {
-    alert(err.message);
-  }
-}
-
-async function toggleArchiveStudent(id, isAdmin = false) {
-  if (!confirm("Are you sure? (Students are safely archived and preserved in the database)")) return;
-  try {
-    await apiFetch(`/api/students/${id}/archive`, { method: "POST" });
-    if (isAdmin) loadAdminStudents();
-    else loadTeacherStudents();
-  } catch (err) {
-    alert(err.message);
-  }
-}
-
-// ----------------- Student Profile View -----------------
-
-function viewStudentProfile(studentId) {
+async function openStudentProfile(studentId) {
   activeStudentProfileId = studentId;
-  navigate("student-profile");
+  try {
+    const data = await apiFetch(`/api/students/${studentId}`);
+    renderStudentProfileView(data);
+    navigate("student-profile");
+  } catch (err) {
+    alert(err.message);
+  }
 }
 
 function returnFromStudentProfile() {
@@ -1004,163 +1150,217 @@ function returnFromStudentProfile() {
   }
 }
 
-async function loadStudentProfile(studentId) {
-  try {
-    const data = await apiFetch(`/api/students/${studentId}`);
-    const st = data.student;
+function renderStudentProfileView(data) {
+  const s = data.student;
+  document.getElementById("profile-student-name").textContent = s.name;
+  document.getElementById("profile-class-badge").textContent = s.class_name;
+  document.getElementById("profile-roll-badge").textContent = s.roll_number ? `Roll: ${s.roll_number}` : 'Roll: —';
+  document.getElementById("profile-guardian-info").textContent = `Guardian: ${s.guardian_name || '—'} (${s.guardian_contact || '—'})`;
+  document.getElementById("profile-teacher-assigned").textContent = s.teacher_name ? `Mentor: ${s.teacher_name}` : 'Mentor: Unassigned';
 
-    document.getElementById("profile-student-name").textContent = st.name;
-    document.getElementById("profile-class-badge").textContent = st.class_name;
-    document.getElementById("profile-guardian-info").textContent = `Guardian: ${st.guardian_name} (${st.guardian_contact})`;
-    document.getElementById("profile-last-updated").textContent = `Profile verified: ${new Date().toLocaleTimeString()}`;
+  const consentBadge = document.getElementById("profile-consent-badge");
+  consentBadge.textContent = s.consent_given ? "Consent Given" : "Consent Pending";
+  consentBadge.className = `badge ${s.consent_given ? 'badge-green' : 'badge-coral'}`;
 
-    if (st.teacher_name) {
-      document.getElementById("profile-teacher-assigned").textContent = `Assigned Teacher: ${st.teacher_name}`;
-    }
+  // Support Info
+  const sup = data.support_info || {};
+  const supBadge = document.getElementById("profile-support-badge");
+  supBadge.textContent = sup.level || "Doing Well";
+  supBadge.className = `badge ${sup.badge_class || 'badge-green'}`;
+  document.getElementById("profile-support-reason").textContent = sup.reason || "—";
 
-    const consentEl = document.getElementById("profile-consent-badge");
-    if (st.consent_given) {
-      consentEl.className = "badge badge-green";
-      consentEl.textContent = "Consent Given ✓";
-    } else {
-      consentEl.className = "badge badge-coral";
-      consentEl.textContent = "Consent Pending";
-    }
-
-    // Support Level (Rule B)
-    const sup = data.support_info;
-    const badgeEl = document.getElementById("profile-support-badge");
-    badgeEl.className = `badge ${sup.badge_class}`;
-    badgeEl.textContent = sup.level;
-    document.getElementById("profile-support-reason").textContent = sup.reason;
-
-    // Gaps (Rule C)
-    const gapsContainer = document.getElementById("profile-gaps-container");
-    const gaps = data.learning_gaps || [];
-    if (gaps.length === 0) {
-      gapsContainer.innerHTML = `<span class="badge badge-green" style="padding: 0.4rem 0.8rem;">No learning gaps identified. All subjects above benchmark!</span>`;
-    } else {
-      gapsContainer.innerHTML = gaps.map(g => `
-        <div class="chip chip-gap">
-          <strong>⚠️ ${escapeHtml(g.subject)}:</strong>
-          <span>${escapeHtml(g.reason)}</span>
-        </div>
-      `).join("");
-    }
-
-    // Recommendations (Rule F)
-    const recsContainer = document.getElementById("profile-recommendations-container");
-    const recs = data.recommendations || [];
-    recsContainer.innerHTML = recs.map(r => `
-      <div style="background-color: var(--bg-elevated); padding: 1rem; border-radius: var(--radius-sm); border-left: 3px solid ${r.type === 'academic' ? 'var(--secondary)' : 'var(--primary)'};">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
-          <strong style="color: var(--text-main); font-size: 0.95rem;">${escapeHtml(r.title)}</strong>
-          <span class="badge badge-neutral" style="font-size: 0.72rem;">${escapeHtml(r.category)}</span>
-        </div>
-        <p style="color: var(--text-muted); font-size: 0.88rem; line-height: 1.5;">${escapeHtml(r.action)}</p>
+  // Learning Gaps Chips
+  const gapsContainer = document.getElementById("profile-gaps-container");
+  if (!data.learning_gaps || data.learning_gaps.length === 0) {
+    gapsContainer.innerHTML = `<span style="font-size: 0.85rem; color: var(--text-dim);">No academic learning gaps currently flagged.</span>`;
+  } else {
+    gapsContainer.innerHTML = data.learning_gaps.map(g => `
+      <div class="chip chip-gap">
+        ⚠️ <strong>${escapeHtml(g.subject)}</strong>: ${escapeHtml(g.reason)}
       </div>
     `).join("");
-
-    // Observations & Follow-ups (Stored in DB)
-    renderObservations(data.observations || []);
-
-    // Academic performance chart
-    renderStudentAcademicChart(data.assessments || []);
-
-    // Assessments table
-    const assessBody = document.getElementById("profile-assessments-body");
-    const assessments = data.assessments || [];
-    if (assessments.length === 0) {
-      assessBody.innerHTML = `<tr><td colspan="5"><div class="empty-state" style="padding: 1.5rem;"><span class="empty-state-icon">📝</span><div class="empty-state-title">No Assessments Recorded</div><p class="empty-state-desc">Click "+ Record Assessment Mark" to log academic tests.</p></div></td></tr>`;
-    } else {
-      assessBody.innerHTML = assessments.map(a => {
-        const pct = Math.round((a.score / (a.max_score || 100)) * 100);
-        const isLow = pct < 40;
-        return `
-          <tr>
-            <td>${escapeHtml(a.date)}</td>
-            <td><strong>${escapeHtml(a.subject)}</strong></td>
-            <td>${a.score} / ${a.max_score || 100}</td>
-            <td><span class="badge ${isLow ? 'badge-coral' : 'badge-green'}">${pct}%</span></td>
-            <td style="color: var(--text-muted);">${escapeHtml(a.notes || '—')}</td>
-          </tr>
-        `;
-      }).join("");
-    }
-
-    // Checkins table (Fernet decrypted)
-    const checkinsBody = document.getElementById("profile-checkins-body");
-    const checkins = data.checkins || [];
-    if (checkins.length === 0) {
-      checkinsBody.innerHTML = `<tr><td colspan="8"><div class="empty-state" style="padding: 1.5rem;"><span class="empty-state-icon">🌱</span><div class="empty-state-title">No Check-in Records</div><p class="empty-state-desc">Student has not submitted any MindMate check-ins yet.</p></div></td></tr>`;
-    } else {
-      checkinsBody.innerHTML = checkins.map(c => {
-        const dateStr = new Date(c.created_at).toLocaleDateString();
-        return `
-          <tr>
-            <td style="white-space: nowrap; color: var(--text-muted);">${dateStr}</td>
-            <td><strong style="font-size: 1rem; color: #a855f7;">${c.score.toFixed(1)} / 5</strong></td>
-            <td>${c.mood}/5</td>
-            <td>${6 - c.stress}/5 <span style="font-size: 0.7rem; color: var(--text-dim);">(raw: ${c.stress})</span></td>
-            <td>${c.sleep}/5</td>
-            <td>${c.focus}/5</td>
-            <td>${c.belonging}/5</td>
-            <td style="font-size: 0.85rem; max-width: 280px;">
-              ${c.note ? `<em>"${escapeHtml(c.note)}"</em>` : '<span style="color: var(--text-dim);">No note</span>'}
-            </td>
-          </tr>
-        `;
-      }).join("");
-    }
-  } catch (err) {
-    alert(err.message);
-    returnFromStudentProfile();
   }
+
+  // Recommendations
+  const recContainer = document.getElementById("profile-recommendations-container");
+  if (!data.recommendations || data.recommendations.length === 0) {
+    recContainer.innerHTML = `<p style="font-size: 0.85rem; color: var(--text-dim);">No specific action items required.</p>`;
+  } else {
+    recContainer.innerHTML = data.recommendations.map(r => `
+      <div style="background-color: var(--bg-elevated); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 0.85rem;">
+        <div style="font-weight: 600; color: var(--primary); margin-bottom: 0.25rem;">${escapeHtml(r.title)}</div>
+        <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.4;">${escapeHtml(r.action)}</div>
+      </div>
+    `).join("");
+  }
+
+  // Observations
+  const obsContainer = document.getElementById("profile-observations-container");
+  if (!data.observations || data.observations.length === 0) {
+    obsContainer.innerHTML = `<div class="empty-state-box" style="margin: 0.5rem 0;">No teacher observations recorded yet.</div>`;
+  } else {
+    obsContainer.innerHTML = data.observations.map(o => `
+      <div style="background-color: var(--bg-elevated); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 0.85rem;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 0.25rem;">
+          <span style="font-weight: 600; font-size: 0.88rem;">${escapeHtml(o.teacher_name || 'Teacher')}</span>
+          <span class="badge ${o.status === 'resolved' ? 'badge-green' : (o.status === 'in_progress' ? 'badge-primary' : 'badge-amber')}">${escapeHtml(o.status)}</span>
+        </div>
+        <p style="font-size: 0.85rem; color: var(--text-main); line-height: 1.4;">${escapeHtml(o.observation_text)}</p>
+        ${o.follow_up_action ? `<p style="font-size: 0.8rem; color: var(--primary); margin-top: 0.35rem;">↳ Plan: ${escapeHtml(o.follow_up_action)}</p>` : ''}
+        <span style="font-size: 0.75rem; color: var(--text-dim); display: block; margin-top: 0.35rem;">${formatDate(o.created_at)}</span>
+      </div>
+    `).join("");
+  }
+
+  // Assessments Table
+  const assBody = document.getElementById("profile-assessments-body");
+  if (!data.assessments || data.assessments.length === 0) {
+    assBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No assessments recorded yet.</td></tr>`;
+  } else {
+    assBody.innerHTML = data.assessments.map(a => {
+      const pct = Math.round((a.score / a.max_score) * 100);
+      return `
+        <tr>
+          <td>${escapeHtml(a.date)}</td>
+          <td><strong>${escapeHtml(a.subject)}</strong></td>
+          <td>${a.score} / ${a.max_score}</td>
+          <td><span class="badge ${pct < 40 ? 'badge-coral' : (pct >= 75 ? 'badge-green' : 'badge-neutral')}">${pct}%</span></td>
+          <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(a.notes || '—')}</span></td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  // Checkins Table
+  const checkBody = document.getElementById("profile-checkins-body");
+  if (!data.checkins || data.checkins.length === 0) {
+    checkBody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No mental health check-ins recorded yet.</td></tr>`;
+  } else {
+    checkBody.innerHTML = data.checkins.map(c => `
+      <tr>
+        <td><span style="font-size: 0.82rem;">${formatDate(c.created_at)}</span></td>
+        <td><strong>${c.score ? c.score.toFixed(1) : '—'} / 5.0</strong></td>
+        <td>${c.mood || '—'}</td>
+        <td>${c.stress || '—'}</td>
+        <td>${c.sleep || '—'}</td>
+        <td>${c.focus || '—'}</td>
+        <td>${c.belonging || '—'}</td>
+        <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(c.note || 'None')}</span></td>
+      </tr>
+    `).join("");
+  }
+
+  renderStudentAcademicChart(data.assessments || []);
 }
 
-function renderObservations(observations) {
-  const container = document.getElementById("profile-observations-container");
-  if (!observations || observations.length === 0) {
-    container.innerHTML = `
-      <div class="empty-state" style="padding: 1.5rem;">
-        <span class="empty-state-icon">📋</span>
-        <div class="empty-state-title">No Observations Logged</div>
-        <p class="empty-state-desc">Click "+ Add Observation" to record behavioral notes and track caring follow-up plans.</p>
-      </div>
-    `;
+function renderStudentAcademicChart(assessments) {
+  const ctx = document.getElementById("studentAcademicChart");
+  if (!ctx) return;
+  if (studentChartInstance) studentChartInstance.destroy();
+
+  if (!assessments || assessments.length === 0) {
     return;
   }
 
-  container.innerHTML = observations.map(o => `
-    <div style="background-color: var(--bg-elevated); padding: 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 0.5rem;">
-        <div>
-          <span class="badge ${o.status === 'completed' ? 'badge-green' : 'badge-amber'}">
-            ${escapeHtml(o.status.toUpperCase())}
-          </span>
-          <span style="font-size: 0.8rem; color: var(--text-dim); margin-left: 0.5rem;">
-            Logged by ${escapeHtml(o.teacher_name)} on ${new Date(o.created_at).toLocaleDateString()}
-          </span>
-        </div>
-        <button class="btn btn-outline btn-sm" onclick="toggleObservationStatus(${o.id}, '${o.status === 'completed' ? 'pending' : 'completed'}')">
-          Mark as ${o.status === 'completed' ? 'Pending' : 'Completed ✓'}
-        </button>
-      </div>
-      <p style="font-size: 0.92rem; color: var(--text-main); margin-bottom: 0.5rem;">${escapeHtml(o.observation_text)}</p>
-      ${o.follow_up_action ? `
-        <div style="font-size: 0.85rem; color: var(--primary); background: var(--primary-light); padding: 0.5rem 0.75rem; border-radius: var(--radius-sm);">
-          <strong>Follow-up Action:</strong> ${escapeHtml(o.follow_up_action)}
-        </div>
-      ` : ''}
-    </div>
-  `).join("");
+  const bySubject = {};
+  assessments.forEach(a => {
+    if (!bySubject[a.subject]) bySubject[a.subject] = [];
+    const pct = Math.round((a.score / a.max_score) * 100);
+    bySubject[a.subject].push({ date: a.date, pct });
+  });
+
+  const allDates = Array.from(new Set(assessments.map(a => a.date))).sort();
+  const colors = ["#8b5cf6", "#3b82f6", "#10b981", "#f59e0b", "#fb7185"];
+  let colorIdx = 0;
+
+  const datasets = Object.keys(bySubject).map(subj => {
+    const c = colors[colorIdx % colors.length];
+    colorIdx++;
+    const dataPoints = allDates.map(d => {
+      const entry = bySubject[subj].find(x => x.date === d);
+      return entry ? entry.pct : null;
+    });
+    return {
+      label: subj,
+      data: dataPoints,
+      borderColor: c,
+      backgroundColor: c,
+      spanGaps: true,
+      tension: 0.25
+    };
+  });
+
+  studentChartInstance = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: allDates,
+      datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: "top", labels: { color: "#94a3b8" } }
+      },
+      scales: {
+        y: {
+          min: 0,
+          max: 100,
+          ticks: { color: "#94a3b8" },
+          grid: { color: "rgba(255,255,255,0.06)" }
+        },
+        x: {
+          ticks: { color: "#94a3b8" },
+          grid: { display: false }
+        }
+      }
+    }
+  });
 }
+
+// ─────────────────────────────────────────────
+//  Teacher Follow-Up Workflow Modal
+// ─────────────────────────────────────────────
+
+function openFollowUpModal(studentId, studentName, currentStatus) {
+  document.getElementById("followup-student-id").value = studentId;
+  document.getElementById("followup-student-name").textContent = `Follow-Up for: ${studentName}`;
+  document.getElementById("followup-status-select").value = currentStatus || "new";
+  document.getElementById("followup-notes").value = "";
+  document.getElementById("modal-followup").style.display = "flex";
+}
+
+function closeFollowUpModal() {
+  document.getElementById("modal-followup").style.display = "none";
+}
+
+async function handleFollowUpSubmit(e) {
+  e.preventDefault();
+  const studentId = document.getElementById("followup-student-id").value;
+  const status = document.getElementById("followup-status-select").value;
+  const notes = document.getElementById("followup-notes").value.trim();
+
+  try {
+    await apiFetch(`/api/students/${studentId}/follow-up`, {
+      method: "PUT",
+      body: JSON.stringify({ status, notes })
+    });
+    closeFollowUpModal();
+    loadTeacherDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Teacher Observations & Assessment Marks Modals
+// ─────────────────────────────────────────────
 
 function openAddObservationModal() {
   document.getElementById("obs-student-id").value = activeStudentProfileId;
   document.getElementById("obs-text").value = "";
   document.getElementById("obs-action").value = "";
-  document.getElementById("obs-status").value = "pending";
+  document.getElementById("obs-status").value = "new";
   document.getElementById("modal-observation").style.display = "flex";
 }
 
@@ -1170,96 +1370,29 @@ function closeObservationModal() {
 
 async function saveObservation(e) {
   e.preventDefault();
-  const student_id = document.getElementById("obs-student-id").value;
+  const studentId = document.getElementById("obs-student-id").value;
   const observation_text = document.getElementById("obs-text").value.trim();
   const follow_up_action = document.getElementById("obs-action").value.trim();
   const status = document.getElementById("obs-status").value;
 
   try {
-    await apiFetch(`/api/students/${student_id}/observations`, {
+    await apiFetch(`/api/students/${studentId}/observations`, {
       method: "POST",
       body: JSON.stringify({ observation_text, follow_up_action, status })
     });
     closeObservationModal();
-    loadStudentProfile(student_id);
+    openStudentProfile(studentId);
   } catch (err) {
     alert(err.message);
   }
-}
-
-async function toggleObservationStatus(obsId, newStatus) {
-  try {
-    await apiFetch(`/api/observations/${obsId}/status`, {
-      method: "PUT",
-      body: JSON.stringify({ status: newStatus })
-    });
-    if (activeStudentProfileId) {
-      loadStudentProfile(activeStudentProfileId);
-    }
-  } catch (err) {
-    alert(err.message);
-  }
-}
-
-function renderStudentAcademicChart(assessments) {
-  const ctx = document.getElementById("studentAcademicChart").getContext("2d");
-  if (studentChartInstance) {
-    studentChartInstance.destroy();
-  }
-
-  const subjects = ["Mathematics", "Science", "English", "History"];
-  const colorMap = {
-    "Mathematics": "#3b82f6",
-    "Science": "#10b981",
-    "English": "#8b5cf6",
-    "History": "#f59e0b"
-  };
-
-  const dates = Array.from(new Set(assessments.map(a => a.date))).sort();
-
-  const datasets = subjects.map(subj => {
-    const dataPoints = dates.map(d => {
-      const match = assessments.find(a => a.subject === subj && a.date === d);
-      return match ? Math.round((match.score / (match.max_score || 100)) * 100) : null;
-    });
-
-    return {
-      label: subj,
-      data: dataPoints,
-      borderColor: colorMap[subj] || "#94a3b8",
-      backgroundColor: colorMap[subj] || "#94a3b8",
-      tension: 0.3,
-      spanGaps: true,
-      borderWidth: 2,
-      pointRadius: 4
-    };
-  });
-
-  studentChartInstance = new Chart(ctx, {
-    type: "line",
-    data: { labels: dates, datasets: datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { position: "top", labels: { color: "#94a3b8" } } },
-      scales: {
-        y: {
-          min: 0,
-          max: 100,
-          ticks: { color: "#94a3b8", callback: v => v + "%" },
-          grid: { color: "rgba(255, 255, 255, 0.05)" }
-        },
-        x: { ticks: { color: "#94a3b8" }, grid: { display: false } }
-      }
-    }
-  });
 }
 
 function openAddMarkModal() {
   document.getElementById("mark-form-student-id").value = activeStudentProfileId;
   document.getElementById("mark-form-score").value = "";
-  document.getElementById("mark-form-notes").value = "";
+  document.getElementById("mark-form-max").value = "100";
   document.getElementById("mark-form-date").value = new Date().toISOString().split("T")[0];
+  document.getElementById("mark-form-notes").value = "";
   document.getElementById("modal-mark").style.display = "flex";
 }
 
@@ -1272,7 +1405,7 @@ async function saveMark(e) {
   const student_id = parseInt(document.getElementById("mark-form-student-id").value);
   const subject = document.getElementById("mark-form-subject").value;
   const score = parseFloat(document.getElementById("mark-form-score").value);
-  const max_score = parseFloat(document.getElementById("mark-form-max").value) || 100.0;
+  const max_score = parseFloat(document.getElementById("mark-form-max").value);
   const date = document.getElementById("mark-form-date").value;
   const notes = document.getElementById("mark-form-notes").value.trim();
 
@@ -1282,103 +1415,66 @@ async function saveMark(e) {
       body: JSON.stringify({ student_id, subject, score, max_score, date, notes })
     });
     closeAddMarkModal();
-    loadStudentProfile(student_id);
+    openStudentProfile(student_id);
   } catch (err) {
     alert(err.message);
   }
 }
 
-// ----------------- Teacher Alerts -----------------
+// ─────────────────────────────────────────────
+//  Teacher Alerts
+// ─────────────────────────────────────────────
 
-let teacherAlertsCache = [];
+let teacherAlertsList = [];
 
 async function loadTeacherAlerts() {
   try {
-    teacherAlertsCache = await apiFetch("/api/alerts");
-    renderAlertsList("all");
+    teacherAlertsList = await apiFetch("/api/alerts");
+    filterAlerts("all");
   } catch (err) {
     console.error("Error loading alerts:", err);
   }
 }
 
 function filterAlerts(status) {
-  document.querySelectorAll("#view-teacher-alerts .card-title button").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll("[id^='filter-alert-']").forEach(b => b.classList.remove("active"));
   const btn = document.getElementById(`filter-alert-${status}`);
   if (btn) btn.classList.add("active");
-  renderAlertsList(status);
+
+  const filtered = status === "all" ? teacherAlertsList : teacherAlertsList.filter(a => a.status === status);
+  renderAlerts(filtered);
 }
 
-function renderAlertsList(statusFilter) {
+function renderAlerts(alerts) {
   const container = document.getElementById("alerts-list-container");
-  const filtered = teacherAlertsCache.filter(a => statusFilter === "all" || a.status === statusFilter);
-
-  if (filtered.length === 0) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <span class="empty-state-icon">✅</span>
-        <div class="empty-state-title">No Alerts in this View</div>
-        <p class="empty-state-desc">There are no open or flagged alerts matching this filter category.</p>
-      </div>
-    `;
+  if (!alerts || alerts.length === 0) {
+    container.innerHTML = `<div class="empty-state-box">No alerts found matching this filter.</div>`;
     return;
   }
 
-  container.innerHTML = filtered.map(a => {
-    const isUrgent = a.severity === "urgent";
-    const statusBadges = {
-      open: "badge-coral",
-      acknowledged: "badge-amber",
-      snoozed: "badge-neutral",
-      resolved: "badge-green"
-    };
-
-    return `
-      <div class="card" style="margin-bottom: 0; ${isUrgent ? 'border: 2px solid var(--status-urgent); background-color: rgba(244, 63, 94, 0.04);' : ''}">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 0.75rem;">
-          <div>
-            <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
-              <h3 style="font-size: 1.1rem; color: var(--text-main);">${escapeHtml(a.title)}</h3>
-              ${isUrgent ? '<span class="badge badge-urgent">🚨 URGENT SAFEGUARDING</span>' : ''}
-              <span class="badge ${statusBadges[a.status] || 'badge-neutral'}">${a.status.toUpperCase()}</span>
-            </div>
-            <div style="font-size: 0.8rem; color: var(--text-dim); margin-top: 0.2rem;">
-              Student: <strong>${escapeHtml(a.student_name)}</strong> (${escapeHtml(a.class_name)}) • Triggered: ${new Date(a.created_at).toLocaleString()}
-            </div>
-          </div>
-          <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">
-            ${a.status !== 'acknowledged' && a.status !== 'resolved' ? `
-              <button class="btn btn-outline btn-sm" onclick="changeAlertStatus(${a.id}, 'acknowledged')">Acknowledge</button>
-            ` : ''}
-            ${a.status !== 'snoozed' && a.status !== 'resolved' ? `
-              <button class="btn btn-outline btn-sm" onclick="changeAlertStatus(${a.id}, 'snoozed')">Snooze</button>
-            ` : ''}
-            ${a.status !== 'resolved' ? `
-              <button class="btn btn-green btn-sm" onclick="changeAlertStatus(${a.id}, 'resolved')">✓ Resolve</button>
-            ` : `
-              <span class="badge badge-green">Resolved</span>
-            `}
-          </div>
+  container.innerHTML = alerts.map(a => `
+    <div style="background-color: var(--bg-elevated); border: 1px solid ${a.severity === 'urgent' ? 'var(--status-urgent)' : 'var(--border-color)'}; border-radius: var(--radius-sm); padding: 1rem;">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">
+        <div>
+          <span class="badge ${a.severity === 'urgent' ? 'badge-coral' : 'badge-neutral'}">${a.severity.toUpperCase()}</span>
+          <strong style="margin-left: 0.5rem; color: var(--text-main); font-size: 1rem;">${escapeHtml(a.title)}</strong>
         </div>
-
-        <div style="margin-top: 0.85rem; font-size: 0.92rem; color: var(--text-muted); line-height: 1.5;">
-          ${escapeHtml(a.message)}
-        </div>
-
-        ${isUrgent ? `
-          <div class="alert-box alert-urgent" style="margin-top: 0.85rem; margin-bottom: 0;">
-            <span style="font-size: 1.2rem;">🛡️</span>
-            <div>
-              <strong>Required Safeguarding Action:</strong>
-              Speak with the student privately today, follow your school's safeguarding policy and involve the counsellor.
-            </div>
-          </div>
-        ` : ''}
+        <span class="badge ${a.status === 'open' ? 'badge-coral' : (a.status === 'resolved' ? 'badge-green' : 'badge-amber')}">${escapeHtml(a.status)}</span>
       </div>
-    `;
-  }).join("");
+      <p style="color: var(--text-muted); font-size: 0.9rem; line-height: 1.5;">${escapeHtml(a.message)}</p>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; border-top: 1px solid var(--border-color); padding-top: 0.75rem;">
+        <span style="font-size: 0.75rem; color: var(--text-dim);">${formatDate(a.created_at)}</span>
+        <div style="display: flex; gap: 0.4rem;">
+          ${a.status !== 'acknowledged' ? `<button class="btn btn-outline btn-sm" onclick="setAlertStatus(${a.id}, 'acknowledged')">Acknowledge</button>` : ''}
+          ${a.status !== 'snoozed' ? `<button class="btn btn-outline btn-sm" onclick="setAlertStatus(${a.id}, 'snoozed')">Snooze</button>` : ''}
+          ${a.status !== 'resolved' ? `<button class="btn btn-primary btn-sm" onclick="setAlertStatus(${a.id}, 'resolved')">Resolve</button>` : ''}
+        </div>
+      </div>
+    </div>
+  `).join("");
 }
 
-async function changeAlertStatus(alertId, newStatus) {
+async function setAlertStatus(alertId, newStatus) {
   try {
     await apiFetch(`/api/alerts/${alertId}/status`, {
       method: "POST",
@@ -1390,349 +1486,122 @@ async function changeAlertStatus(alertId, newStatus) {
   }
 }
 
-// ----------------- Student Portal Section -----------------
+// ─────────────────────────────────────────────
+//  Student Portal Engine (Strict Privacy)
+// ─────────────────────────────────────────────
 
 async function loadStudentPortal() {
   try {
     const data = await apiFetch("/api/dashboard");
-    if (!data.student) {
-      document.getElementById("student-portal-welcome").textContent = "Welcome to MindMate!";
-      return;
-    }
-
     const st = data.student;
-    document.getElementById("student-portal-welcome").textContent = `Welcome, ${st.name}! (${st.class_name})`;
-
-    // Support indicator
-    const sup = data.support_info;
-    const badge = document.getElementById("student-support-badge");
-    badge.className = `badge ${sup.badge_class}`;
-    badge.textContent = sup.level;
-
-    const heading = document.getElementById("student-wellbeing-heading");
-    const desc = document.getElementById("student-wellbeing-desc");
-    const emoji = document.getElementById("student-wellbeing-emoji");
-
-    if (sup.level === "Thriving") {
-      emoji.textContent = "🌟";
-      heading.textContent = "You're Thriving!";
-      desc.textContent = "Your check-ins show balanced energy, focus, and positive connection. Keep up your wonderful momentum!";
-    } else if (sup.level === "Doing okay") {
-      emoji.textContent = "🌱";
-      heading.textContent = "You're Doing Okay";
-      desc.textContent = "Some days feel great, and some days feel busy. Your teachers are here to support your learning every step of the way.";
-    } else {
-      emoji.textContent = "💛";
-      heading.textContent = "We're Here For You";
-      desc.textContent = "It looks like school or stress might be weighing on you. Remember you don't have to carry it alone — talk to your teacher or trusted adult.";
+    if (st) {
+      document.getElementById("student-portal-welcome").textContent = `Welcome, ${st.name}!`;
+      document.getElementById("student-mentor-info").textContent = `Class: ${st.class_name}${st.roll_number ? ` • Roll: ${st.roll_number}` : ''}${data.mentor_name ? ` • Mentor: ${data.mentor_name}` : ''}`;
     }
 
     // Assessments
-    const assessContainer = document.getElementById("student-assessments-container");
-    const assessments = data.assessments || [];
-    if (assessments.length === 0) {
-      assessContainer.innerHTML = `<div class="empty-state" style="padding:1rem;"><p>No assessment marks logged yet.</p></div>`;
+    const assContainer = document.getElementById("student-assessments-container");
+    if (!data.assessments || data.assessments.length === 0) {
+      assContainer.innerHTML = `<p style="font-size: 0.85rem; color: var(--text-dim);">No academic assessments posted yet.</p>`;
     } else {
-      assessContainer.innerHTML = assessments.map(a => `
-        <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color);">
-          <div>
-            <strong>${escapeHtml(a.subject)}</strong>
-            <span style="font-size:0.75rem; color:var(--text-muted); margin-left: 0.5rem;">${escapeHtml(a.date)}</span>
+      assContainer.innerHTML = data.assessments.map(a => {
+        const pct = Math.round((a.score / a.max_score) * 100);
+        return `
+          <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color);">
+            <div>
+              <strong>${escapeHtml(a.subject)}</strong>
+              <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(a.date)}</div>
+            </div>
+            <span class="badge ${pct < 40 ? 'badge-coral' : 'badge-green'}">${pct}%</span>
           </div>
-          <div>
-            <span class="badge ${Math.round((a.score/(a.max_score||100))*100) < 40 ? 'badge-coral' : 'badge-green'}">
-              ${a.score} / ${a.max_score || 100} (${Math.round((a.score/(a.max_score||100))*100)}%)
-            </span>
-          </div>
-        </div>
-      `).join("");
+        `;
+      }).join("");
     }
 
-    // Recommendations & Guidance
+    // Recommendations & Guidance (Supportive strength-based tips)
     const recContainer = document.getElementById("student-recommendations-container");
-    const recs = data.recommendations || [];
-    if (recs.length === 0) {
-      recContainer.innerHTML = `<p style="color:var(--text-muted);">Keep learning at your own pace and reach out to your teacher with questions.</p>`;
+    if (!data.recommendations || data.recommendations.length === 0) {
+      recContainer.innerHTML = `<p style="font-size: 0.85rem; color: var(--text-dim);">Complete your daily check-in to receive personalized learning and well-being strategies!</p>`;
     } else {
-      recContainer.innerHTML = recs.map(r => `
-        <div style="background-color: var(--bg-elevated); padding: 0.85rem 1rem; border-radius: var(--radius-sm); border-left: 3px solid var(--primary);">
-          <strong>${escapeHtml(r.title)}</strong>
-          <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.25rem;">${escapeHtml(r.action)}</p>
+      recContainer.innerHTML = data.recommendations.map(r => `
+        <div style="background-color: var(--bg-elevated); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 0.85rem;">
+          <div style="font-weight: 600; color: var(--primary); margin-bottom: 0.25rem;">🌱 ${escapeHtml(r.title)}</div>
+          <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.5;">${escapeHtml(r.action)}</div>
         </div>
       `).join("");
     }
-  } catch (err) {
-    console.error("Student portal load failed:", err);
-  }
-}
 
-// Student Self Check-in
-const EMOJI_SETS = {
-  mood: [
-    { val: 1, icon: "😞", label: "Very Low" },
-    { val: 2, icon: "🙁", label: "Down" },
-    { val: 3, icon: "😐", label: "Okay" },
-    { val: 4, icon: "🙂", label: "Good" },
-    { val: 5, icon: "😄", label: "Great" }
-  ],
-  stress: [
-    { val: 1, icon: "😌", label: "Calm" },
-    { val: 2, icon: "🙂", label: "Low" },
-    { val: 3, icon: "😐", label: "Moderate" },
-    { val: 4, icon: "😟", label: "High" },
-    { val: 5, icon: "😫", label: "Overwhelmed" }
-  ],
-  sleep: [
-    { val: 1, icon: "🥱", label: "Very Poor" },
-    { val: 2, icon: "😴", label: "Restless" },
-    { val: 3, icon: "😐", label: "Fair" },
-    { val: 4, icon: "🛏️", label: "Good" },
-    { val: 5, icon: "🌟", label: "Refreshed" }
-  ],
-  focus: [
-    { val: 1, icon: "🌫️", label: "Hard" },
-    { val: 2, icon: "💭", label: "Distracted" },
-    { val: 3, icon: "😐", label: "Okay" },
-    { val: 4, icon: "🎯", label: "Focused" },
-    { val: 5, icon: "🚀", label: "Sharp" }
-  ],
-  belonging: [
-    { val: 1, icon: "👤", label: "Alone" },
-    { val: 2, icon: "🌧️", label: "Isolated" },
-    { val: 3, icon: "😐", label: "Neutral" },
-    { val: 4, icon: "🤝", label: "Supported" },
-    { val: 5, icon: "💛", label: "Valued" }
-  ]
-};
-
-function openStudentSelfCheckinModal() {
-  ["mood", "stress", "sleep", "focus", "belonging"].forEach(f => {
-    selfCheckinAnswers[f] = null;
-    renderSelfCheckinOptions(f);
-  });
-  document.getElementById("self-checkin-note").value = "";
-  document.getElementById("self-checkin-error").style.display = "none";
-  document.getElementById("modal-self-checkin").style.display = "flex";
-}
-
-function closeStudentSelfCheckinModal() {
-  document.getElementById("modal-self-checkin").style.display = "none";
-}
-
-function renderSelfCheckinOptions(field) {
-  const container = document.getElementById(`self-q-${field}`);
-  const currentVal = selfCheckinAnswers[field];
-  container.innerHTML = EMOJI_SETS[field].map(opt => `
-    <button type="button" class="emoji-btn ${currentVal === opt.val ? 'selected' : ''}" onclick="selectSelfCheckinOption('${field}', ${opt.val})">
-      <span class="emoji-icon">${opt.icon}</span>
-      <span class="emoji-label">${opt.label}</span>
-    </button>
-  `).join("");
-}
-
-function selectSelfCheckinOption(field, val) {
-  selfCheckinAnswers[field] = val;
-  renderSelfCheckinOptions(field);
-}
-
-async function submitStudentSelfCheckin(e) {
-  e.preventDefault();
-  const errorEl = document.getElementById("self-checkin-error");
-  errorEl.style.display = "none";
-
-  for (let field of ["mood", "stress", "sleep", "focus", "belonging"]) {
-    if (!selfCheckinAnswers[field]) {
-      errorEl.textContent = `Please tap an emoji answer for question: ${field}.`;
-      errorEl.style.display = "block";
-      return;
+    // Student History (Dates & Submitted Notes Only, NO internal concern scores)
+    if (currentUser && currentUser.student_id) {
+      const profile = await apiFetch(`/api/students/${currentUser.student_id}`);
+      const historyBody = document.getElementById("student-history-body");
+      if (!profile.checkins || profile.checkins.length === 0) {
+        historyBody.innerHTML = `<tr><td colspan="2" style="text-align: center; color: var(--text-muted);">No check-in submissions yet.</td></tr>`;
+      } else {
+        historyBody.innerHTML = profile.checkins.map(c => `
+          <tr>
+            <td><span style="font-size: 0.85rem;">${formatDate(c.created_at)}</span></td>
+            <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(c.note || 'None recorded')}</span></td>
+          </tr>
+        `).join("");
+      }
     }
-  }
-
-  const note = document.getElementById("self-checkin-note").value.trim();
-  const payload = { ...selfCheckinAnswers, note: note || null };
-
-  try {
-    await apiFetch("/api/students/me/checkin", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-    alert("Thank you! Your check-in reflection has been submitted.");
-    closeStudentSelfCheckinModal();
-    loadStudentPortal();
   } catch (err) {
-    errorEl.textContent = err.message;
-    errorEl.style.display = "block";
+    console.error("Error loading student portal:", err);
   }
 }
 
-// ----------------- Kiosk Check-In Mode -----------------
+// ─────────────────────────────────────────────
+//  Phase 4: Adaptive Mental Health Check-In Engine
+// ─────────────────────────────────────────────
 
-const KIOSK_QUESTIONS = [
-  { num: 1, field: "mood", title: "How are you feeling overall today?", desc: "Tap an emoji that best represents your mood right now.", options: EMOJI_SETS.mood },
-  { num: 2, field: "stress", title: "How stressed or overwhelmed do you feel?", desc: "1 is completely calm, 5 is deeply overwhelmed.", options: EMOJI_SETS.stress },
-  { num: 3, field: "sleep", title: "How well did you sleep last night?", desc: "Good rest helps your energy and thinking.", options: EMOJI_SETS.sleep },
-  { num: 4, field: "focus", title: "How easy is it to focus in class today?", desc: "Are you feeling dialed in or distracted?", options: EMOJI_SETS.focus },
-  { num: 5, field: "belonging", title: "Do you feel supported and connected with others?", desc: "How connected do you feel to your classmates and teachers?", options: EMOJI_SETS.belonging },
-  { num: 6, field: "note", title: "Anything else you want to share with your teacher?", desc: "This note is encrypted and shared privately with your teacher.", options: [] }
-];
-
-async function openKioskLauncher() {
+async function startStudentAdaptiveCheckIn() {
+  isClassroomDeviceSession = false;
   try {
-    const students = await apiFetch("/api/students");
-    const select = document.getElementById("kiosk-student-select");
-    if (!students || students.length === 0) {
-      alert("No students currently enrolled in your classes. Enroll a student first.");
-      return;
-    }
-    select.innerHTML = students.map(s => `<option value="${s.id}">${s.name} (${s.class_name})</option>`).join("");
+    const res = await apiFetch("/api/checkins/start", { method: "POST" });
+    activeAdaptiveSessionId = res.session_id;
+    currentQuestionData = res.question;
+    selectedAdaptiveAnswers = [];
 
-    document.getElementById("kiosk-teacher-pin").value = "";
-    document.getElementById("kiosk-launch-error").style.display = "none";
-    document.getElementById("kiosk-step-launch").style.display = "block";
-    document.getElementById("kiosk-step-questions").style.display = "none";
-    document.getElementById("kiosk-step-complete").style.display = "none";
+    document.getElementById("checkin-step-launch").style.display = "none";
+    document.getElementById("checkin-step-complete").style.display = "none";
+    document.getElementById("checkin-step-questions").style.display = "block";
+    document.getElementById("checkin-overlay").style.display = "flex";
 
-    document.getElementById("kiosk-overlay").style.display = "flex";
+    renderAdaptiveQuestion(res);
   } catch (err) {
     alert(err.message);
   }
 }
 
-async function startKioskSession() {
-  const pinInput = document.getElementById("kiosk-teacher-pin").value.trim();
-  const studentSelect = document.getElementById("kiosk-student-select");
-  const errorEl = document.getElementById("kiosk-launch-error");
+function openClassroomCheckInLauncher() {
+  isClassroomDeviceSession = true;
+  document.getElementById("checkin-teacher-pin").value = "";
+  document.getElementById("checkin-launch-error").style.display = "none";
 
-  if (!pinInput) {
-    errorEl.textContent = "Please enter your Teacher PIN.";
-    errorEl.style.display = "block";
+  // Populate student list for classroom device
+  const sel = document.getElementById("checkin-student-select");
+  sel.innerHTML = teacherStudentsList.map(s =>
+    `<option value="${s.id}">${escapeHtml(s.name)} (${escapeHtml(s.class_name)}${s.roll_number ? ` • Roll ${s.roll_number}` : ''})</option>`
+  ).join("");
+
+  document.getElementById("checkin-step-launch").style.display = "block";
+  document.getElementById("checkin-step-questions").style.display = "none";
+  document.getElementById("checkin-step-complete").style.display = "none";
+  document.getElementById("checkin-overlay").style.display = "flex";
+}
+
+async function startClassroomCheckInSession() {
+  const pin = document.getElementById("checkin-teacher-pin").value.trim();
+  const studentId = document.getElementById("checkin-student-select").value;
+  const errEl = document.getElementById("checkin-launch-error");
+  errEl.style.display = "none";
+
+  if (!pin) {
+    errEl.textContent = "Please enter your Teacher PIN.";
+    errEl.style.display = "block";
     return;
   }
-
-  try {
-    await apiFetch("/api/auth/verify-pin", {
-      method: "POST",
-      body: JSON.stringify({ pin: pinInput })
-    });
-
-    kioskTeacherPin = pinInput;
-    kioskStudentId = parseInt(studentSelect.value);
-    kioskCurrentStep = 1;
-
-    ["mood", "stress", "sleep", "focus", "belonging"].forEach(f => kioskAnswers[f] = null);
-    kioskAnswers.note = "";
-    document.getElementById("kiosk-student-note").value = "";
-
-    document.getElementById("kiosk-step-launch").style.display = "none";
-    document.getElementById("kiosk-step-questions").style.display = "block";
-    renderKioskStep();
-  } catch (err) {
-    errorEl.textContent = "Incorrect Teacher PIN. Please try again.";
-    errorEl.style.display = "block";
-  }
-}
-
-function renderKioskStep() {
-  const q = KIOSK_QUESTIONS[kioskCurrentStep - 1];
-
-  for (let i = 1; i <= 6; i++) {
-    const dot = document.getElementById(`dot-${i}`);
-    dot.className = "progress-dot";
-    if (i === kioskCurrentStep) dot.classList.add("active");
-    else if (i < kioskCurrentStep) dot.classList.add("done");
-  }
-
-  document.getElementById("kiosk-question-number").textContent = `Step ${kioskCurrentStep} of 6`;
-  document.getElementById("kiosk-question-title").textContent = q.title;
-  document.getElementById("kiosk-question-desc").textContent = q.desc;
-
-  const emojiGrid = document.getElementById("kiosk-emoji-grid");
-  const noteSection = document.getElementById("kiosk-note-section");
-  const nextBtn = document.getElementById("kiosk-next-btn");
-  const prevBtn = document.getElementById("kiosk-prev-btn");
-
-  prevBtn.style.visibility = kioskCurrentStep > 1 ? "visible" : "hidden";
-
-  if (q.field === "note") {
-    emojiGrid.style.display = "none";
-    noteSection.style.display = "block";
-    nextBtn.disabled = false;
-    nextBtn.textContent = "Submit Check-In ✓";
-  } else {
-    emojiGrid.style.display = "grid";
-    noteSection.style.display = "none";
-    nextBtn.textContent = "Continue →";
-
-    const currentVal = kioskAnswers[q.field];
-    nextBtn.disabled = (currentVal === null);
-
-    emojiGrid.innerHTML = q.options.map(opt => `
-      <button class="emoji-btn ${currentVal === opt.val ? 'selected' : ''}" onclick="selectKioskOption('${q.field}', ${opt.val})">
-        <span class="emoji-icon">${opt.icon}</span>
-        <span class="emoji-label">${opt.label}</span>
-      </button>
-    `).join("");
-  }
-}
-
-function selectKioskOption(field, val) {
-  kioskAnswers[field] = val;
-  renderKioskStep();
-}
-
-function prevKioskQuestion() {
-  if (kioskCurrentStep > 1) {
-    kioskCurrentStep--;
-    renderKioskStep();
-  }
-}
-
-async function nextKioskQuestion() {
-  if (kioskCurrentStep < 6) {
-    kioskCurrentStep++;
-    renderKioskStep();
-  } else {
-    kioskAnswers.note = document.getElementById("kiosk-student-note").value.trim();
-
-    try {
-      const payload = {
-        student_id: kioskStudentId,
-        mood: kioskAnswers.mood,
-        stress: kioskAnswers.stress,
-        sleep: kioskAnswers.sleep,
-        focus: kioskAnswers.focus,
-        belonging: kioskAnswers.belonging,
-        note: kioskAnswers.note || null,
-        teacher_pin: kioskTeacherPin
-      };
-
-      await apiFetch("/api/checkins/kiosk", {
-        method: "POST",
-        body: JSON.stringify(payload)
-      });
-
-      document.getElementById("kiosk-step-questions").style.display = "none";
-      document.getElementById("kiosk-step-complete").style.display = "block";
-    } catch (err) {
-      alert("Error submitting check-in: " + err.message);
-    }
-  }
-}
-
-function promptKioskExit() {
-  document.getElementById("prompt-exit-pin").value = "";
-  document.getElementById("pin-prompt-error").style.display = "none";
-  document.getElementById("modal-pin-prompt").style.display = "flex";
-}
-
-function closePinPrompt() {
-  document.getElementById("modal-pin-prompt").style.display = "none";
-}
-
-async function confirmKioskExit(e) {
-  e.preventDefault();
-  const pin = document.getElementById("prompt-exit-pin").value.trim();
-  const errorEl = document.getElementById("pin-prompt-error");
 
   try {
     await apiFetch("/api/auth/verify-pin", {
@@ -1740,24 +1609,311 @@ async function confirmKioskExit(e) {
       body: JSON.stringify({ pin })
     });
 
-    closePinPrompt();
-    document.getElementById("kiosk-overlay").style.display = "none";
-    if (currentView === "teacher-dashboard") loadTeacherDashboard();
-    else if (currentView === "student-profile" && activeStudentProfileId) loadStudentProfile(activeStudentProfileId);
+    // Start checkin for student using teacher auth or token
+    const res = await apiFetch("/api/checkins/start", { method: "POST" });
+    activeAdaptiveSessionId = res.session_id;
+    currentQuestionData = res.question;
+    selectedAdaptiveAnswers = [];
+
+    document.getElementById("checkin-step-launch").style.display = "none";
+    document.getElementById("checkin-step-questions").style.display = "block";
+    renderAdaptiveQuestion(res);
   } catch (err) {
-    errorEl.textContent = "Incorrect Teacher PIN. Exit denied.";
-    errorEl.style.display = "block";
+    errEl.textContent = err.message;
+    errEl.style.display = "block";
   }
 }
 
-// ----------------- Utilities -----------------
+function renderAdaptiveQuestion(payload) {
+  const q = payload.question;
+  currentQuestionData = q;
+  selectedAdaptiveAnswers = [];
 
-function escapeHtml(str) {
-  if (!str) return "";
-  return String(str)
+  document.getElementById("checkin-q-domain").textContent = q.domain;
+  document.getElementById("checkin-q-progress").textContent = `Step ${payload.total_answered + 1}`;
+  document.getElementById("checkin-progress-bar").style.width = `${payload.progress_pct || 10}%`;
+  document.getElementById("checkin-q-text").textContent = q.question_text;
+  document.getElementById("checkin-error-msg").style.display = "none";
+
+  const container = document.getElementById("checkin-options-container");
+  const noteWrap = document.getElementById("checkin-note-wrap");
+  const freeText = document.getElementById("checkin-free-text");
+  const preferNotBtn = document.getElementById("checkin-prefer-not-btn");
+  const submitBtn = document.getElementById("checkin-submit-btn");
+
+  freeText.value = "";
+  submitBtn.disabled = true;
+
+  preferNotBtn.style.display = q.prefer_not_to_answer ? "inline-block" : "none";
+
+  if (q.answer_type === "optional_free_text") {
+    container.innerHTML = "";
+    noteWrap.style.display = "block";
+    submitBtn.disabled = false;
+    return;
+  }
+
+  noteWrap.style.display = "none";
+
+  const isMulti = q.answer_type === "multi_choice";
+  container.innerHTML = (q.options || []).map(opt => `
+    <div class="adaptive-option-item" id="opt-item-${opt.id}" onclick="handleOptionClick('${opt.id}', ${isMulti})">
+      <div class="option-checkbox-indicator">${isMulti ? '✓' : '●'}</div>
+      <span>${escapeHtml(opt.label)}</span>
+    </div>
+  `).join("");
+}
+
+function handleOptionClick(optId, isMulti) {
+  const submitBtn = document.getElementById("checkin-submit-btn");
+
+  if (isMulti) {
+    const idx = selectedAdaptiveAnswers.indexOf(optId);
+    if (idx > -1) {
+      selectedAdaptiveAnswers.splice(idx, 1);
+      document.getElementById(`opt-item-${optId}`).classList.remove("selected");
+    } else {
+      selectedAdaptiveAnswers.push(optId);
+      document.getElementById(`opt-item-${optId}`).classList.add("selected");
+    }
+  } else {
+    selectedAdaptiveAnswers = [optId];
+    document.querySelectorAll(".adaptive-option-item").forEach(el => el.classList.remove("selected"));
+    const target = document.getElementById(`opt-item-${optId}`);
+    if (target) target.classList.add("selected");
+  }
+
+  submitBtn.disabled = selectedAdaptiveAnswers.length === 0;
+}
+
+async function submitAdaptiveAnswer() {
+  const submitBtn = document.getElementById("checkin-submit-btn");
+  const errBox = document.getElementById("checkin-error-msg");
+  errBox.style.display = "none";
+  submitBtn.disabled = true;
+
+  let answerVal = null;
+  if (currentQuestionData.answer_type === "optional_free_text") {
+    answerVal = document.getElementById("checkin-free-text").value.trim();
+  } else if (currentQuestionData.answer_type === "multi_choice") {
+    answerVal = selectedAdaptiveAnswers;
+  } else {
+    answerVal = selectedAdaptiveAnswers[0] || null;
+  }
+
+  const note = document.getElementById("checkin-free-text").value.trim() || null;
+
+  try {
+    const res = await apiFetch(`/api/checkins/${activeAdaptiveSessionId}/answer`, {
+      method: "POST",
+      body: JSON.stringify({
+        question_id: currentQuestionData.id,
+        answer: answerVal,
+        preferred_not_to_answer: false,
+        note
+      })
+    });
+
+    if (res.status === "completed") {
+      renderCheckInCompletion(res);
+    } else {
+      renderAdaptiveQuestion(res);
+    }
+  } catch (err) {
+    errBox.textContent = err.message;
+    errBox.style.display = "block";
+    submitBtn.disabled = false;
+  }
+}
+
+async function submitPreferNotToAnswer() {
+  try {
+    const res = await apiFetch(`/api/checkins/${activeAdaptiveSessionId}/answer`, {
+      method: "POST",
+      body: JSON.stringify({
+        question_id: currentQuestionData.id,
+        answer: null,
+        preferred_not_to_answer: true
+      })
+    });
+
+    if (res.status === "completed") {
+      renderCheckInCompletion(res);
+    } else {
+      renderAdaptiveQuestion(res);
+    }
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+function renderCheckInCompletion(res) {
+  document.getElementById("checkin-step-questions").style.display = "none";
+  document.getElementById("checkin-step-complete").style.display = "block";
+
+  const sgBox = document.getElementById("checkin-safeguarding-calm");
+  const sgText = document.getElementById("checkin-safeguarding-text");
+
+  if (res.urgent_flag && res.safeguarding_message) {
+    sgText.textContent = res.safeguarding_message;
+    sgBox.style.display = "flex";
+  } else {
+    sgBox.style.display = "none";
+  }
+
+  const guidanceBox = document.getElementById("checkin-completion-guidance");
+  if (res.recommendations && res.recommendations.length > 0) {
+    guidanceBox.innerHTML = res.recommendations.map(r => `
+      <div style="background-color: var(--bg-elevated); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 0.85rem;">
+        <div style="font-weight: 600; color: var(--primary); margin-bottom: 0.25rem;">🌱 ${escapeHtml(r.title)}</div>
+        <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.5;">${escapeHtml(r.action)}</div>
+      </div>
+    `).join("");
+  } else {
+    guidanceBox.innerHTML = `<p style="font-size: 0.85rem; color: var(--text-dim);">No specific strategies needed. Keep shining!</p>`;
+  }
+}
+
+function finishCheckInSession() {
+  document.getElementById("checkin-overlay").style.display = "none";
+  activeAdaptiveSessionId = null;
+  currentQuestionData = null;
+  if (isClassroomDeviceSession) {
+    loadTeacherDashboard();
+  } else {
+    loadStudentPortal();
+  }
+}
+
+function exitCheckInOverlay() {
+  if (isClassroomDeviceSession) {
+    document.getElementById("prompt-exit-pin").value = "";
+    document.getElementById("pin-prompt-error").style.display = "none";
+    document.getElementById("modal-pin-prompt").style.display = "flex";
+  } else {
+    document.getElementById("checkin-overlay").style.display = "none";
+    activeAdaptiveSessionId = null;
+    currentQuestionData = null;
+    loadStudentPortal();
+  }
+}
+
+function closePinPrompt() {
+  document.getElementById("modal-pin-prompt").style.display = "none";
+}
+
+async function confirmCheckInExit(e) {
+  e.preventDefault();
+  const pin = document.getElementById("prompt-exit-pin").value.trim();
+  const errEl = document.getElementById("pin-prompt-error");
+  errEl.style.display = "none";
+
+  try {
+    await apiFetch("/api/auth/verify-pin", {
+      method: "POST",
+      body: JSON.stringify({ pin })
+    });
+    closePinPrompt();
+    document.getElementById("checkin-overlay").style.display = "none";
+    activeAdaptiveSessionId = null;
+    currentQuestionData = null;
+    loadTeacherDashboard();
+  } catch (err) {
+    errEl.textContent = "Invalid PIN.";
+    errEl.style.display = "block";
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Password Reset Modal (Admin)
+// ─────────────────────────────────────────────
+
+function openResetPasswordModal(id, type, name) {
+  document.getElementById("reset-target-id").value = id;
+  document.getElementById("reset-target-type").value = type;
+  document.getElementById("reset-target-name").textContent = `Resetting password for ${type}: ${name}`;
+  document.getElementById("reset-new-password").value = "";
+  document.getElementById("modal-reset-password").style.display = "flex";
+}
+
+function closeResetPasswordModal() {
+  document.getElementById("modal-reset-password").style.display = "none";
+}
+
+async function handleAdminResetPassword(e) {
+  e.preventDefault();
+  const id = document.getElementById("reset-target-id").value;
+  const type = document.getElementById("reset-target-type").value;
+  const new_password = document.getElementById("reset-new-password").value;
+
+  try {
+    const endpoint = type === "teacher"
+      ? `/api/admin/teachers/${id}/reset-password`
+      : `/api/admin/students/${id}/reset-password`;
+
+    await apiFetch(endpoint, {
+      method: "POST",
+      body: JSON.stringify({ new_password })
+    });
+
+    closeResetPasswordModal();
+    alert("Password reset successfully. The user will be prompted to change it on their next login.");
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Audit Logs Loader
+// ─────────────────────────────────────────────
+
+async function loadAuditLogs() {
+  try {
+    const logs = await apiFetch("/api/admin/audit-logs");
+    const tbody = document.getElementById("admin-audit-table-body");
+    if (!logs || logs.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No audit log events recorded yet.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = logs.map(l => `
+      <tr>
+        <td><span style="font-size: 0.8rem;">${formatDate(l.timestamp)}</span></td>
+        <td><code>${escapeHtml(l.user_email || 'System')}</code></td>
+        <td><span class="badge badge-neutral">${escapeHtml(l.action)}</span></td>
+        <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(l.resource_type || '—')}</span></td>
+        <td><span style="font-size: 0.85rem; color: var(--text-main);">${escapeHtml(l.details)}</span></td>
+      </tr>
+    `).join("");
+  } catch (err) {
+    console.error("Error loading audit logs:", err);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Utility Functions
+// ─────────────────────────────────────────────
+
+function escapeHtml(text) {
+  if (!text) return "";
+  return String(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function formatDate(isoString) {
+  if (!isoString) return "—";
+  try {
+    const d = new Date(isoString);
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+  } catch (e) {
+    return isoString;
+  }
 }

@@ -1,4 +1,5 @@
 import os
+import secrets
 import time
 import bcrypt
 import jwt
@@ -8,7 +9,20 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from database import get_db
 
-JWT_SECRET = os.environ.get("MINDMATE_JWT_SECRET", "mindmate-super-secret-jwt-key-2026-change-in-production")
+JWT_SECRET = os.environ.get("MINDMATE_JWT_SECRET")
+if not JWT_SECRET:
+    # Keep local/server restarts compatible while avoiding hardcoded signing credentials.
+    _secret_path = os.path.join(os.path.dirname(__file__), ".mindmate.jwt_secret")
+    try:
+        if os.path.exists(_secret_path):
+            with open(_secret_path, "r", encoding="utf-8") as secret_file:
+                JWT_SECRET = secret_file.read().strip()
+        if not JWT_SECRET:
+            JWT_SECRET = secrets.token_urlsafe(48)
+            with open(_secret_path, "x", encoding="utf-8") as secret_file:
+                secret_file.write(JWT_SECRET)
+    except OSError:
+        JWT_SECRET = secrets.token_urlsafe(48)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_SECONDS = 86400 * 7  # 7 days
 

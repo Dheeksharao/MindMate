@@ -464,7 +464,8 @@ tr:hover td {
   border: 1px solid rgba(251, 113, 133, 0.35);
 }
 
-/* Kiosk Mode Fullscreen */
+/* Mental Health Check-In Mode Fullscreen Overlay */
+.checkin-overlay,
 .kiosk-overlay {
   position: fixed;
   top: 0;
@@ -478,8 +479,10 @@ tr:hover td {
   justify-content: center;
   align-items: center;
   padding: 2rem;
+  overflow-y: auto;
 }
 
+.checkin-exit-btn,
 .kiosk-exit-btn {
   position: absolute;
   top: 1.5rem;
@@ -492,8 +495,9 @@ tr:hover td {
   cursor: pointer;
 }
 
+.checkin-box,
 .kiosk-box {
-  max-width: 640px;
+  max-width: 680px;
   width: 100%;
   background-color: var(--bg-card);
   border: 1px solid var(--border-color);
@@ -501,13 +505,108 @@ tr:hover td {
   padding: 2.5rem;
   box-shadow: 0 20px 40px rgba(0, 0, 0, 0.7);
   text-align: center;
+  margin: auto;
 }
 
+.checkin-progress,
 .kiosk-progress {
   display: flex;
   justify-content: center;
   gap: 0.5rem;
   margin-bottom: 2rem;
+}
+
+/* Portal Tabs */
+.portal-tabs {
+  display: flex;
+  background-color: var(--bg-elevated);
+  border-radius: var(--radius-md);
+  padding: 4px;
+  gap: 4px;
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--border-color);
+}
+
+.portal-tab-btn {
+  flex: 1;
+  padding: 0.65rem 0.5rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.portal-tab-btn.active {
+  background-color: var(--primary);
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(139, 92, 246, 0.4);
+}
+
+/* Adaptive Option Cards */
+.adaptive-options-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 1.75rem 0;
+  text-align: left;
+}
+
+.adaptive-option-item {
+  background-color: var(--bg-elevated);
+  border: 2px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 1rem 1.25rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  transition: all 0.2s ease;
+  color: var(--text-main);
+  font-size: 0.95rem;
+}
+
+.adaptive-option-item:hover {
+  border-color: var(--border-focus);
+  background-color: rgba(139, 92, 246, 0.08);
+}
+
+.adaptive-option-item.selected {
+  border-color: var(--primary);
+  background-color: rgba(139, 92, 246, 0.18);
+  font-weight: 600;
+}
+
+.option-checkbox-indicator {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: 2px solid var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 0.75rem;
+}
+
+.adaptive-option-item.selected .option-checkbox-indicator {
+  border-color: var(--primary);
+  background-color: var(--primary);
+  color: white;
+}
+
+/* Empty State Box */
+.empty-state-box {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-md);
+  margin: 1rem 0;
 }
 
 .progress-dot {

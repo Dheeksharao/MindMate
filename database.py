@@ -154,7 +154,39 @@ def init_db():
         );
         """)
 
-        # 9. settings: admin-configurable app settings
+        # 9. check_in_questions: Question bank in the database (100+ questions across 8+ domains)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS check_in_questions (
+            id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            question_text TEXT NOT NULL,
+            answer_type TEXT NOT NULL, -- 'single_choice', 'multi_choice', 'scale', 'optional_free_text'
+            options_json TEXT NOT NULL, -- JSON array of options: [{"id": "...", "label": "...", "concern_score": 0.0, "tags": [...]}]
+            prefer_not_to_answer INTEGER NOT NULL DEFAULT 1,
+            version INTEGER NOT NULL DEFAULT 1,
+            branching_rules_json TEXT NOT NULL DEFAULT '{}', -- JSON object specifying follow-up conditions
+            is_root INTEGER NOT NULL DEFAULT 0, -- 1 if this is part of the core screening flow
+            root_order INTEGER NOT NULL DEFAULT 0
+        );
+        """)
+
+        # 10. check_in_sessions: Active and completed adaptive check-in sessions
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS check_in_sessions (
+            id TEXT PRIMARY KEY,
+            student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'in_progress', -- 'in_progress', 'completed', 'abandoned'
+            current_question_id TEXT REFERENCES check_in_questions(id),
+            question_history_json TEXT NOT NULL DEFAULT '[]',
+            answers_json TEXT NOT NULL DEFAULT '{}',
+            domain_scores_json TEXT NOT NULL DEFAULT '{}',
+            concern_tags_json TEXT NOT NULL DEFAULT '[]',
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        """)
+
+        # 11. settings: admin-configurable app settings
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -163,7 +195,7 @@ def init_db():
         );
         """)
 
-        # 10. audit_logs
+        # 12. audit_logs
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,13 +209,65 @@ def init_db():
         );
         """)
 
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identifier TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            requested_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+        );
+        """)
+
         # ---- Migrations for existing tables ----
         cursor.execute("PRAGMA table_info(users)")
-        user_cols = [r["name"] for r in cursor.fetchall()]
+        raw_user_info = cursor.fetchall()
+        user_info = {r["name"]: r for r in raw_user_info}
+        user_cols = list(user_info.keys())
+
+        # If email was created with NOT NULL constraint, recreate users table so student logins without email are supported
+        if user_info.get("email") and user_info["email"]["notnull"] == 1:
+            cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.execute("""
+            CREATE TABLE users_migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                username TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                assigned_classes TEXT NOT NULL DEFAULT '',
+                check_in_pin TEXT NOT NULL DEFAULT '1234',
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+                lockout_until TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """)
+            cursor.execute("""
+            INSERT INTO users_migrated (id, email, username, password_hash, full_name, role, is_active, assigned_classes, check_in_pin, must_change_password, failed_login_attempts, lockout_until, created_at, updated_at)
+            SELECT id, email, username, password_hash, full_name, role,
+                   COALESCE(is_active, 1), COALESCE(assigned_classes, ''),
+                   COALESCE(check_in_pin, '1234'), COALESCE(must_change_password, 0),
+                   COALESCE(failed_login_attempts, 0), lockout_until,
+                   created_at, updated_at
+            FROM users;
+            """)
+            cursor.execute("DROP TABLE users;")
+            cursor.execute("ALTER TABLE users_migrated RENAME TO users;")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique ON users(username);")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            # Refresh user_cols
+            cursor.execute("PRAGMA table_info(users)")
+            user_cols = [r["name"] for r in cursor.fetchall()]
         if "is_active" not in user_cols:
             cursor.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
         if "username" not in user_cols:
-            cursor.execute("ALTER TABLE users ADD COLUMN username TEXT UNIQUE")
+            cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique ON users(username)")
         if "check_in_pin" not in user_cols:
             # rename kiosk_pin -> check_in_pin if it exists, else just add
             if "kiosk_pin" in user_cols:
@@ -216,6 +300,24 @@ def init_db():
             # migrate old 'pending','in_progress','completed' to new statuses
             cursor.execute("UPDATE observations SET status = 'new' WHERE status = 'pending'")
             cursor.execute("UPDATE observations SET status = 'resolved' WHERE status = 'completed'")
+
+        cursor.execute("PRAGMA table_info(checkins)")
+        checkin_cols = [r["name"] for r in cursor.fetchall()]
+        checkin_new_cols = {
+            "session_id": "TEXT",
+            "wellbeing_indicator": "TEXT DEFAULT ''",
+            "indicator_reasons": "TEXT DEFAULT ''",
+            "domain_scores_json": "TEXT DEFAULT '{}'",
+            "academic_concerns_json": "TEXT DEFAULT '[]'",
+            "teaching_concerns_json": "TEXT DEFAULT '[]'",
+            "recommendations_json": "TEXT DEFAULT '[]'",
+            "urgent_flag": "INTEGER DEFAULT 0",
+            "follow_up_status": "TEXT DEFAULT 'none'",
+            "answers_snapshot_json": "TEXT DEFAULT '{}'"
+        }
+        for col, col_def in checkin_new_cols.items():
+            if col not in checkin_cols:
+                cursor.execute(f"ALTER TABLE checkins ADD COLUMN {col} {col_def}")
 
         # Seed default settings if not present
         from datetime import datetime, timezone
@@ -251,6 +353,10 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_student ON recommendations(student_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_history_student ON assignment_history(student_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_user_timestamp ON audit_logs(user_id, timestamp);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_questions_domain ON check_in_questions(domain);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_questions_root ON check_in_questions(is_root, root_order);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_student ON check_in_sessions(student_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON check_in_sessions(status);")
 
 if __name__ == "__main__":
     init_db()

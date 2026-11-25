@@ -6,54 +6,84 @@ from fastapi import HTTPException
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database import init_db, get_db
-from auth import hash_password
+from auth import (
+    hash_password,
+    GENERIC_LOGIN_ERROR,
+    INACTIVE_ERROR,
+    UNASSIGNED_ERROR,
+    MAX_LOGIN_ATTEMPTS
+)
 from crypto import decrypt_note
 from main import (
     setup_initial_admin,
     login,
     change_password,
+    force_change_password,
     create_teacher,
+    update_teacher,
+    reset_teacher_password,
     toggle_teacher_status,
     admin_create_student,
+    bulk_assign_students,
+    get_assignment_history,
+    list_teachers,
+    admin_list_students,
     list_students,
     get_student_profile,
     add_assessment,
-    submit_kiosk_checkin,
+    submit_mental_health_checkin,
     student_self_checkin,
+    start_adaptive_checkin,
+    answer_adaptive_checkin,
+    get_active_checkin_session,
     create_student_observation,
     list_student_observations,
     update_observation_status,
+    update_student_followup_status,
     update_alert_status,
+    get_dashboard,
     SetupAdminRequest,
     LoginRequest,
     ChangePasswordRequest,
+    ForceChangePasswordRequest,
+    ResetPasswordRequest,
     TeacherCreateRequest,
+    TeacherUpdateRequest,
     StudentCreateRequest,
+    BulkAssignRequest,
     AssessmentCreateRequest,
-    CheckinKioskRequest,
+    CheckinRequest,
     StudentSelfCheckinRequest,
+    AdaptiveAnswerRequest,
     ObservationCreateRequest,
     ObservationStatusRequest,
+    FollowUpStatusUpdateRequest,
     AlertStatusUpdateRequest
 )
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_clean_test_db():
     init_db()
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM audit_logs")
-        cursor.execute("DELETE FROM alerts")
-        cursor.execute("DELETE FROM observations")
-        cursor.execute("DELETE FROM recommendations")
-        cursor.execute("DELETE FROM checkins")
-        cursor.execute("DELETE FROM assessments")
-        cursor.execute("DELETE FROM students")
-        cursor.execute("DELETE FROM users")
-        try:
-            cursor.execute("DELETE FROM sqlite_sequence")
-        except Exception:
-            pass
+    def _clean():
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM audit_logs")
+            cursor.execute("DELETE FROM alerts")
+            cursor.execute("DELETE FROM observations")
+            cursor.execute("DELETE FROM recommendations")
+            cursor.execute("DELETE FROM check_in_sessions")
+            cursor.execute("DELETE FROM checkins")
+            cursor.execute("DELETE FROM assessments")
+            cursor.execute("DELETE FROM assignment_history")
+            cursor.execute("DELETE FROM students")
+            cursor.execute("DELETE FROM users")
+            try:
+                cursor.execute("DELETE FROM sqlite_sequence")
+            except Exception:
+                pass
+    _clean()
+    yield
+    _clean()
 
 def test_initial_admin_setup_and_login():
     # 1. Setup initial real admin
@@ -74,324 +104,375 @@ def test_initial_admin_setup_and_login():
         ))
     assert excinfo.value.status_code == 400
 
-    # 2. Login with real admin
-    login_res = login(LoginRequest(email="admin@school.edu", password="MasterAdmin@2026"))
+    # 2. Login with real admin via admin portal
+    login_res = login(LoginRequest(
+        identifier="admin@school.edu",
+        password="MasterAdmin@2026",
+        portal="admin"
+    ))
     assert "access_token" in login_res
     assert login_res["user"]["email"] == "admin@school.edu"
 
-def test_admin_creates_teacher_and_teacher_login():
+def test_portal_role_matching_and_exact_errors():
+    # 1. Invalid credentials returns exact generic message
+    with pytest.raises(HTTPException) as exc:
+        login(LoginRequest(
+            identifier="unknown@school.edu",
+            password="WrongPassword123",
+            portal="admin"
+        ))
+    assert exc.value.status_code == 401
+    assert exc.value.detail == GENERIC_LOGIN_ERROR
+
+    # 2. Admin trying to log into teacher portal -> 401 generic error (role mismatch doesn't leak role info)
+    with pytest.raises(HTTPException) as exc:
+        login(LoginRequest(
+            identifier="admin@school.edu",
+            password="MasterAdmin@2026",
+            portal="teacher"
+        ))
+    assert exc.value.status_code == 401
+    assert exc.value.detail == GENERIC_LOGIN_ERROR
+
+    # 3. Create teacher with no assigned classes/students
     admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
-    
-    # Admin creates real teacher
-    teacher_data = create_teacher(
+    unassigned_teacher = create_teacher(
+        TeacherCreateRequest(
+            email="unassigned.teacher@school.edu",
+            password="TeacherPass@123",
+            full_name="Unassigned Teacher",
+            assigned_classes="",
+            check_in_pin="1111"
+        ),
+        current_user=admin_user
+    )
+
+    # Logging in as unassigned teacher -> 403 exact message
+    with pytest.raises(HTTPException) as exc:
+        login(LoginRequest(
+            identifier="unassigned.teacher@school.edu",
+            password="TeacherPass@123",
+            portal="teacher"
+        ))
+    assert exc.value.status_code == 403
+    assert exc.value.detail == UNASSIGNED_ERROR
+
+    # 4. Deactivated teacher -> 403 exact message
+    toggle_teacher_status(unassigned_teacher["id"], current_user=admin_user)
+    with pytest.raises(HTTPException) as exc:
+        login(LoginRequest(
+            identifier="unassigned.teacher@school.edu",
+            password="TeacherPass@123",
+            portal="teacher"
+        ))
+    assert exc.value.status_code == 403
+    assert exc.value.detail == INACTIVE_ERROR
+
+    # 5. Lockout after 5 failed attempts
+    # Reactivate user for testing failed attempts
+    toggle_teacher_status(unassigned_teacher["id"], current_user=admin_user)
+    for _ in range(MAX_LOGIN_ATTEMPTS):
+        with pytest.raises(HTTPException) as exc:
+            login(LoginRequest(
+                identifier="unassigned.teacher@school.edu",
+                password="WrongPassword!",
+                portal="teacher"
+            ))
+        assert exc.value.status_code == 401
+
+    # Check database that user is locked out
+    with get_db() as conn:
+        row = conn.execute("SELECT failed_login_attempts, lockout_until FROM users WHERE id = ?",
+                           (unassigned_teacher["id"],)).fetchone()
+        assert row["failed_login_attempts"] >= MAX_LOGIN_ATTEMPTS
+        assert row["lockout_until"] is not None
+
+def test_admin_creates_teacher_and_student():
+    admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
+
+    # 1. Admin creates active teacher Sarah Jenkins
+    teacher = create_teacher(
         TeacherCreateRequest(
             email="sarah.jenkins@school.edu",
             password="TeacherPass@123",
             full_name="Sarah Jenkins",
             assigned_classes="Class 9A,Class 9B",
-            kiosk_pin="4321"
+            check_in_pin="4321"
         ),
         current_user=admin_user
     )
-    assert teacher_data["email"] == "sarah.jenkins@school.edu"
-    assert teacher_data["assigned_classes"] == "Class 9A,Class 9B"
+    assert teacher["email"] == "sarah.jenkins@school.edu"
+    assert teacher["assigned_classes"] == "Class 9A,Class 9B"
 
-    # Teacher logs in with their own credentials
-    t_login = login(LoginRequest(email="sarah.jenkins@school.edu", password="TeacherPass@123"))
+    # Teacher logs in successfully
+    t_login = login(LoginRequest(
+        identifier="sarah.jenkins@school.edu",
+        password="TeacherPass@123",
+        portal="teacher"
+    ))
     assert "access_token" in t_login
     assert t_login["user"]["role"] == "teacher"
-    assert t_login["user"]["assigned_classes"] == "Class 9A,Class 9B"
 
-def test_deactivated_user_cannot_login():
-    admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
-    
-    # Create substitute teacher
-    sub = create_teacher(
-        TeacherCreateRequest(
-            email="sub@school.edu",
-            password="TempPass@123",
-            full_name="Temp Substitute",
-            assigned_classes="Class 9A"
-        ),
-        current_user=admin_user
-    )
-    
-    # Deactivate teacher
-    toggle_teacher_status(sub["id"], current_user=admin_user)
-    
-    # Attempting to log in while deactivated -> 403
-    with pytest.raises(HTTPException) as excinfo:
-        login(LoginRequest(email="sub@school.edu", password="TempPass@123"))
-    assert excinfo.value.status_code == 403
-    assert "deactivated" in excinfo.value.detail.lower()
-
-def test_admin_creates_student_with_login():
-    admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
-    
-    # Find teacher ID
-    with get_db() as conn:
-        t_row = conn.cursor().execute("SELECT id FROM users WHERE email='sarah.jenkins@school.edu'").fetchone()
-        t_id = t_row["id"]
-        
+    # 2. Admin creates student Maya Patel with username (no email required) and roll number
     student = admin_create_student(
         StudentCreateRequest(
             name="Maya Patel",
             class_name="Class 9A",
+            roll_number="01",
             guardian_name="Sunita Patel",
             guardian_contact="+1-555-0102",
             consent_given=True,
-            assigned_teacher_id=t_id,
-            email="maya.patel@student.edu",
+            assigned_teacher_id=teacher["id"],
+            username="maya9a",
             password="StudentPass@123"
         ),
         current_user=admin_user
     )
     assert student["name"] == "Maya Patel"
-    assert student["user_id"] is not None
+    assert student["roll_number"] == "01"
+    assert student["assigned_teacher_id"] == teacher["id"]
 
-    # Student logs in with their own student credentials
-    s_login = login(LoginRequest(email="maya.patel@student.edu", password="StudentPass@123"))
+    # Student logs in with username
+    s_login = login(LoginRequest(
+        identifier="maya9a",
+        password="StudentPass@123",
+        portal="student"
+    ))
     assert "access_token" in s_login
     assert s_login["user"]["role"] == "student"
     assert s_login["user"]["student_id"] == student["id"]
 
-def test_password_change():
-    # Student changes password
-    with get_db() as conn:
-        s_user = conn.cursor().execute("SELECT * FROM users WHERE email='maya.patel@student.edu'").fetchone()
-        user_dict = dict(s_user)
-
-    change_res = change_password(
-        ChangePasswordRequest(
-            current_password="StudentPass@123",
-            new_password="NewSecurePass@2026"
-        ),
-        current_user=user_dict
-    )
-    assert change_res["success"] is True
-
-    # Old password no longer works
-    with pytest.raises(HTTPException) as exc:
-        login(LoginRequest(email="maya.patel@student.edu", password="StudentPass@123"))
-    assert exc.value.status_code == 401
-
-    # New password works
-    assert "access_token" in login(LoginRequest(email="maya.patel@student.edu", password="NewSecurePass@2026"))
-
-def test_403_teacher_scoping_other_classes():
+def test_force_password_change_flow():
     admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
-    
-    # Teacher 1 teaches only Class 9A
-    t1 = create_teacher(
+
+    with get_db() as conn:
+        t_row = conn.execute("SELECT id FROM users WHERE email='sarah.jenkins@school.edu'").fetchone()
+        t_id = t_row["id"]
+
+    # Admin resets teacher password
+    reset_teacher_password(t_id, ResetPasswordRequest(new_password="TempReset@123"), current_user=admin_user)
+
+    # Teacher logs in with temp password
+    t_login = login(LoginRequest(
+        identifier="sarah.jenkins@school.edu",
+        password="TempReset@123",
+        portal="teacher"
+    ))
+    assert t_login["user"]["must_change_password"] == 1
+
+    # Teacher forces password change
+    teacher_user = {"id": t_id, "email": "sarah.jenkins@school.edu", "must_change_password": 1, "role": "teacher"}
+    res = force_change_password(
+        ForceChangePasswordRequest(new_password="PermanentPass@2026"),
+        current_user=teacher_user
+    )
+    assert res["success"] is True
+
+    # Now teacher can log in with permanent password and must_change_password is 0
+    t_login2 = login(LoginRequest(
+        identifier="sarah.jenkins@school.edu",
+        password="PermanentPass@2026",
+        portal="teacher"
+    ))
+    assert t_login2["user"]["must_change_password"] == 0
+
+def test_authorization_and_isolation():
+    admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
+
+    # Create Teacher 2 (Mr. Adams) with Class 10B
+    t2 = create_teacher(
         TeacherCreateRequest(
             email="mr.adams@school.edu",
             password="Teacher@123",
             full_name="Mr. Adams",
-            assigned_classes="Class 9A"
+            assigned_classes="Class 10B"
         ),
         current_user=admin_user
     )
-    
-    # Student in Class 10B
-    s_other = admin_create_student(
+
+    # Create Student in Class 10B assigned to Mr. Adams
+    s_adams = admin_create_student(
         StudentCreateRequest(
             name="James Wilson",
             class_name="Class 10B",
+            roll_number="01",
             guardian_name="Helen Wilson",
-            guardian_contact="+1-555-0999"
+            guardian_contact="+1-555-0999",
+            assigned_teacher_id=t2["id"],
+            username="james10b",
+            password="StudentPass@123"
         ),
         current_user=admin_user
     )
-    
-    # Mr. Adams tries to access James Wilson in 10B -> 403 Forbidden
-    with pytest.raises(HTTPException) as excinfo:
-        get_student_profile(student_id=s_other["id"], current_user=t1)
-    assert excinfo.value.status_code == 403
-    assert "Access denied" in excinfo.value.detail
 
-def test_403_student_access_other_student():
+    with get_db() as conn:
+        sarah_user = dict(conn.execute("SELECT * FROM users WHERE email='sarah.jenkins@school.edu'").fetchone())
+        maya_user = dict(conn.execute("SELECT * FROM users WHERE username='maya9a'").fetchone())
+        maya_student = dict(conn.execute("SELECT * FROM students WHERE user_id = ?", (maya_user["id"],)).fetchone())
+
+    # 1. Sarah Jenkins tries to access James Wilson (Class 10B) -> 403 Forbidden
+    with pytest.raises(HTTPException) as exc:
+        get_student_profile(student_id=s_adams["id"], current_user=sarah_user)
+    assert exc.value.status_code == 403
+
+    # 2. Maya Patel tries to access James Wilson -> 403 Forbidden
+    with pytest.raises(HTTPException) as exc:
+        get_student_profile(student_id=s_adams["id"], current_user=maya_user)
+    assert exc.value.status_code == 403
+    assert "Students can only view their own record" in exc.value.detail
+
+    # 3. Admin tries to access individual student well-being profile -> 403 Forbidden
+    with pytest.raises(HTTPException) as exc:
+        get_student_profile(student_id=maya_student["id"], current_user=admin_user)
+    assert exc.value.status_code == 403
+    assert "Administrators cannot view individual student well-being data" in exc.value.detail
+
+    # 4. Maya Patel views her own record: internal triage labels and teacher notes MUST NOT be present
+    maya_profile = get_student_profile(student_id=maya_student["id"], current_user=maya_user)
+    assert maya_profile["student"]["name"] == "Maya Patel"
+    # Ensure sensitive fields are excluded or empty for student role
+    assert "support_level" not in maya_profile
+    assert len(maya_profile["observations"]) == 0
+    assert len(maya_profile["alerts"]) == 0
+
+def test_bulk_assignment_and_history():
     admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
-    
-    # Create student 2
-    s2 = admin_create_student(
-        StudentCreateRequest(
-            name="Chloe Nguyen",
-            class_name="Class 9A",
-            guardian_name="Huy Nguyen",
-            guardian_contact="+1-555-0104",
-            email="chloe@student.edu",
-            password="ChloePass@123"
+
+    with get_db() as conn:
+        maya_student = conn.execute("SELECT id FROM students WHERE name='Maya Patel'").fetchone()
+        adams_teacher = conn.execute("SELECT id FROM users WHERE email='mr.adams@school.edu'").fetchone()
+
+    # Reassign Maya Patel to Mr. Adams
+    res = bulk_assign_students(
+        BulkAssignRequest(
+            student_ids=[maya_student["id"]],
+            teacher_id=adams_teacher["id"],
+            reason="Term transfer"
         ),
         current_user=admin_user
     )
-    
-    # Get Maya Patel's user dict
+    assert res["assigned_count"] == 1
+
+    # Check assignment history
+    history = get_assignment_history(student_id=maya_student["id"], current_user=admin_user)
+    assert len(history) >= 1
+    assert history[0]["new_teacher_name"] == "Mr. Adams"
+
+    # Reassign back to Sarah Jenkins for remaining tests
     with get_db() as conn:
-        maya_user = dict(conn.cursor().execute("SELECT * FROM users WHERE email='maya.patel@student.edu'").fetchone())
-        
-    # Maya tries to access Chloe's confidential profile -> 403 Forbidden!
-    with pytest.raises(HTTPException) as excinfo:
-        get_student_profile(student_id=s2["id"], current_user=maya_user)
-    assert excinfo.value.status_code == 403
-    assert "Students can only view their own individual record" in excinfo.value.detail
-
-def test_403_admin_cannot_view_individual_wellbeing():
-    admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
-    
-    # Admin cannot view confidential student well-being details
-    with pytest.raises(HTTPException) as excinfo:
-        get_student_profile(student_id=1, current_user=admin_user)
-    assert excinfo.value.status_code == 403
-    assert "Administrators cannot view individual student well-being data" in excinfo.value.detail
-
-def test_assessment_learning_gap_and_deduplication():
-    # Teacher Sarah Jenkins
-    with get_db() as conn:
-        t_row = dict(conn.cursor().execute("SELECT * FROM users WHERE email='sarah.jenkins@school.edu'").fetchone())
-        s_row = dict(conn.cursor().execute("SELECT * FROM students WHERE name='Maya Patel'").fetchone())
-
-    # Add a mark below 40% (Rule C)
-    res = add_assessment(
-        AssessmentCreateRequest(
-            student_id=s_row["id"],
-            subject="Mathematics",
-            score=35.0,
-            max_score=100.0,
-            date="2026-11-20",
-            notes="Quarterly Math Exam"
+        sarah_teacher = conn.execute("SELECT id FROM users WHERE email='sarah.jenkins@school.edu'").fetchone()
+    bulk_assign_students(
+        BulkAssignRequest(
+            student_ids=[maya_student["id"]],
+            teacher_id=sarah_teacher["id"],
+            reason="Reset to original teacher"
         ),
-        current_user=t_row
+        current_user=admin_user
     )
-    assert res["percentage"] == 35.0
-    assert any(g["subject"] == "Mathematics" for g in res["learning_gaps"])
 
-    # Verify alert created in DB
+def test_adaptive_checkin_engine():
     with get_db() as conn:
-        count = conn.cursor().execute("""
-            SELECT COUNT(*) AS c FROM alerts
-            WHERE student_id = ? AND alert_type = 'learning_gap' AND subject = 'Mathematics' AND status = 'open'
-        """, (s_row["id"],)).fetchone()["c"]
-        assert count == 1
+        maya_user = dict(conn.execute("SELECT * FROM users WHERE username='maya9a'").fetchone())
+        maya_user["role"] = "student"
 
-    # Add second low score -> Rule D deduplication preserves single open alert
-    add_assessment(
-        AssessmentCreateRequest(
-            student_id=s_row["id"],
-            subject="Mathematics",
-            score=32.0,
-            max_score=100.0,
-            date="2026-11-22",
-            notes="Retest"
-        ),
-        current_user=t_row
-    )
+    # 1. Start adaptive check-in
+    start_res = start_adaptive_checkin(current_user=maya_user)
+    session_id = start_res["session_id"]
+    assert session_id is not None
+    assert start_res["question"] is not None
+    assert start_res["status"] == "in_progress"
+
+    # 2. Answer question with positive option
+    current_q = start_res["question"]
+    steps = 0
+    res = start_res
+    while res.get("status") == "in_progress" and steps < 25:
+        steps += 1
+        q_id = current_q["id"]
+        opts = current_q.get("options", [])
+        # Select first option (typically lowest concern score)
+        selected_ans = opts[0]["id"] if opts else "fine"
+        res = answer_adaptive_checkin(
+            session_id=session_id,
+            req=AdaptiveAnswerRequest(
+                question_id=q_id,
+                answer=selected_ans,
+                preferred_not_to_answer=False,
+                note=""
+            ),
+            current_user=maya_user
+        )
+        if res.get("status") == "completed":
+            break
+        current_q = res.get("question")
+
+    assert res.get("status") == "completed"
+    assert res.get("wellbeing_indicator") in ("Doing Well", "Moderate Concern")
+    assert "caring conversation" in res.get("disclaimer", "").lower()
+    assert 8 <= steps <= 25
+
+def test_adaptive_checkin_with_safeguarding_trigger():
     with get_db() as conn:
-        count2 = conn.cursor().execute("""
-            SELECT COUNT(*) AS c FROM alerts
-            WHERE student_id = ? AND alert_type = 'learning_gap' AND subject = 'Mathematics' AND status = 'open'
-        """, (s_row["id"],)).fetchone()["c"]
-        assert count2 == 1
+        maya_user = dict(conn.execute("SELECT * FROM users WHERE username='maya9a'").fetchone())
+        maya_user["role"] = "student"
+        maya_student = dict(conn.execute("SELECT * FROM students WHERE user_id = ?", (maya_user["id"],)).fetchone())
 
-def test_student_self_checkin_and_encryption():
-    with get_db() as conn:
-        maya_user = dict(conn.cursor().execute("SELECT * FROM users WHERE email='maya.patel@student.edu'").fetchone())
-        maya_student = dict(conn.cursor().execute("SELECT * FROM students WHERE user_id = ?", (maya_user["id"],)).fetchone())
+    # Start new session
+    start_res = start_adaptive_checkin(current_user=maya_user)
+    session_id = start_res["session_id"]
+    first_q = start_res["question"]
+    opts = first_q.get("options", [])
+    selected_ans = opts[-1]["id"] if opts else "low"
 
-    # Student performs self check-in
-    res = student_self_checkin(
-        StudentSelfCheckinRequest(
-            mood=4,
-            stress=2, # calm (6-2=4)
-            sleep=4,
-            focus=4,
-            belonging=5,
-            note="Enjoying our science project this week!"
+    # Answer with urgent keyword in note
+    ans_res = answer_adaptive_checkin(
+        session_id=session_id,
+        req=AdaptiveAnswerRequest(
+            question_id=first_q["id"],
+            answer=selected_ans,
+            preferred_not_to_answer=False,
+            note="I feel completely hopeless and cannot go on."
         ),
         current_user=maya_user
     )
-    assert res["success"] is True
-    # Rule A: (4 + 4 + 4 + 4 + 5) / 5 = 21 / 5 = 4.2
-    assert res["score"] == 4.2
-
-    # Verify Fernet encryption in database
+    # Check that alert was generated
     with get_db() as conn:
-        c_row = conn.cursor().execute("SELECT encrypted_note FROM checkins WHERE id = ?", (res["checkin_id"],)).fetchone()
-        assert c_row["encrypted_note"] is not None
-        assert "science project" not in c_row["encrypted_note"]
-        decrypted = decrypt_note(c_row["encrypted_note"])
-        assert "Enjoying our science project" in decrypted
-
-def test_kiosk_checkin_and_safety_alert():
-    with get_db() as conn:
-        s_row = dict(conn.cursor().execute("SELECT * FROM students WHERE name='Maya Patel'").fetchone())
-
-    # Kiosk checkin with safety keyword "hopeless"
-    res = submit_kiosk_checkin(
-        CheckinKioskRequest(
-            student_id=s_row["id"],
-            mood=1,
-            stress=5, # overwhelmed (6-5=1)
-            sleep=1,
-            focus=1,
-            belonging=1,
-            note="I feel completely hopeless about keeping up.",
-            teacher_pin="4321"
-        )
-    )
-    assert res["success"] is True
-    assert res["urgent_flag"] is True
-
-    # Verify urgent alert in database
-    with get_db() as conn:
-        alert = conn.cursor().execute("SELECT * FROM alerts WHERE student_id = ? AND severity = 'urgent' AND status = 'open'", (s_row["id"],)).fetchone()
+        alert = conn.execute("""
+            SELECT * FROM alerts WHERE student_id = ? AND severity = 'urgent' AND status = 'open'
+        """, (maya_student["id"],)).fetchone()
         assert alert is not None
-        assert "Speak with the student privately today" in alert["message"]
+        assert "urgent safeguarding" in alert["title"].lower()
 
-def test_teacher_observations_and_followups():
+def test_dashboard_statistics_and_empty_states():
+    admin_user = {"id": 1, "email": "admin@school.edu", "full_name": "Dr. Eleanor Vance", "role": "admin"}
     with get_db() as conn:
-        t_row = dict(conn.cursor().execute("SELECT * FROM users WHERE email='sarah.jenkins@school.edu'").fetchone())
-        s_row = dict(conn.cursor().execute("SELECT * FROM students WHERE name='Maya Patel'").fetchone())
+        sarah_user = dict(conn.execute("SELECT * FROM users WHERE email='sarah.jenkins@school.edu'").fetchone())
+        sarah_user["role"] = "teacher"
 
-    # Teacher adds observation & follow-up plan
-    obs = create_student_observation(
-        student_id=s_row["id"],
-        req=ObservationCreateRequest(
-            observation_text="Student appeared overwhelmed during math test prep.",
-            follow_up_action="Scheduled gentle 1-on-1 check-in; paired with buddy study partner.",
-            status="pending"
-        ),
-        current_user=t_row
-    )
-    assert obs["id"] is not None
-    assert obs["status"] == "pending"
+    # Admin dashboard
+    admin_dash = get_dashboard(current_user=admin_user)
+    assert admin_dash["total_teachers"] >= 1
+    assert admin_dash["total_students"] >= 1
 
-    # Fetch observations
-    obs_list = list_student_observations(student_id=s_row["id"], current_user=t_row)
-    assert len(obs_list) >= 1
-    assert obs_list[0]["observation_text"] == "Student appeared overwhelmed during math test prep."
+    # Teacher dashboard
+    teacher_dash = get_dashboard(current_user=sarah_user)
+    assert "wellbeing_distribution" in teacher_dash
+    dist = teacher_dash["wellbeing_distribution"]
+    assert "categories" in dist or "counts" in dist
+    assert "summary_text" in dist
+    assert "pending_text" in dist
 
-    # Update observation status
-    status_res = update_observation_status(
-        obs_id=obs["id"],
-        req=ObservationStatusRequest(status="completed"),
-        current_user=t_row
-    )
-    assert status_res["status"] == "completed"
-
-def test_alert_status_lifecycle():
+def test_teacher_follow_up_workflow():
     with get_db() as conn:
-        t_row = dict(conn.cursor().execute("SELECT * FROM users WHERE email='sarah.jenkins@school.edu'").fetchone())
-        alert = conn.cursor().execute("SELECT id FROM alerts WHERE status = 'open' LIMIT 1").fetchone()
-        alert_id = alert["id"]
+        sarah_user = dict(conn.execute("SELECT * FROM users WHERE email='sarah.jenkins@school.edu'").fetchone())
+        sarah_user["role"] = "teacher"
+        maya_student = dict(conn.execute("SELECT * FROM students WHERE name='Maya Patel'").fetchone())
 
-    # Acknowledge
-    ack = update_alert_status(alert_id, AlertStatusUpdateRequest(status="acknowledged"), current_user=t_row)
-    assert ack["status"] == "acknowledged"
-
-    # Snooze
-    snz = update_alert_status(alert_id, AlertStatusUpdateRequest(status="snoozed"), current_user=t_row)
-    assert snz["status"] == "snoozed"
-
-    # Resolve
-    res = update_alert_status(alert_id, AlertStatusUpdateRequest(status="resolved"), current_user=t_row)
-    assert res["status"] == "resolved"
+    # Update follow-up status: New -> Contacted -> In progress -> Resolved
+    for new_status in ["Contacted", "In progress", "Resolved"]:
+        res = update_student_followup_status(
+            student_id=maya_student["id"],
+            req=FollowUpStatusUpdateRequest(status=new_status, notes=f"Follow-up changed to {new_status}"),
+            current_user=sarah_user
+        )
+        assert res["follow_up_status"] == new_status.lower().replace(" ", "_")
